@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>__CLIENT_NAME__物流__REPORT_TYPE__ | __PERIOD_SHORT__</title>
+<style>
+  @page { size: A4; margin: 9mm 12mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    color: #1f2937;
+    background: #fff;
+    line-height: 1.42;
+    font-size: 10.5px;
+  }
+  .page-break { page-break-before: always; }
+  .header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 8px; border-bottom: 2.5px solid #1e3a5f; margin-bottom: 9px;
+  }
+  .header-left h1 { font-size: 19px; font-weight: 700; color: #1e3a5f; letter-spacing: 0.5px; }
+  .header-left .sub { font-size: 10px; color: #6b7280; margin-top: 2px; }
+  .header-right { text-align: right; }
+  .header-right .badge {
+    display: inline-block; background: #1e3a5f; color: #fff;
+    font-size: 9.5px; font-weight: 600; padding: 3px 11px;
+    border-radius: 3px; letter-spacing: 1px;
+  }
+  .header-right .date { font-size: 10px; color: #6b7280; margin-top: 4px; }
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-bottom: 10px; }
+  .kpi-card {
+    border: 1px solid #d1d5db; border-radius: 6px; padding: 7px 9px; text-align: center;
+    background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); position: relative; overflow: hidden;
+  }
+  .kpi-card::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 3px; }
+  .kpi-card.c1::after { background: #1e3a5f; }
+  .kpi-card.c2::after { background: #059669; }
+  .kpi-card.c3::after { background: #0284c7; }
+  .kpi-card.c4::after { background: #d97706; }
+  .kpi-card .label { font-size: 9.5px; color: #6b7280; margin-bottom: 3px; }
+  .kpi-card .value { font-size: 20px; font-weight: 700; line-height: 1.1; }
+  .kpi-card.c1 .value { color: #1e3a5f; }
+  .kpi-card.c2 .value { color: #059669; }
+  .kpi-card.c3 .value { color: #0284c7; }
+  .kpi-card.c4 .value { color: #d97706; }
+  .kpi-card .unit { font-size: 9px; color: #9ca3af; margin-top: 2px; }
+  .section { margin-bottom: 8px; }
+  .section-title {
+    display: flex; align-items: center; font-size: 12px; font-weight: 700; color: #1e3a5f;
+    margin-bottom: 5px; padding-bottom: 3px; border-bottom: 1.5px solid #e5e7eb;
+  }
+  .section-title .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; background: #1e3a5f; color: #fff;
+    border-radius: 50%; font-size: 10px; margin-right: 7px; flex-shrink: 0;
+  }
+  .section-title .line { flex: 1; height: 1px; background: #e5e7eb; margin-left: 10px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+  .col-title {
+    font-size: 10.5px; font-weight: 600; color: #374151;
+    margin-bottom: 4px; padding-left: 6px; border-left: 3px solid #94a3b8;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 10px; }
+  table th {
+    background: #1e3a5f; color: #fff; padding: 4px 5px; text-align: center;
+    font-weight: 600; font-size: 9.5px;
+  }
+  table td { padding: 3.5px 5px; text-align: center; border-bottom: 1px solid #e5e7eb; }
+  table tr:nth-child(even) td { background: #f8fafc; }
+  table .text-left { text-align: left; }
+  table .total-row td {
+    background: #e8eef5 !important; font-weight: 700; color: #1e3a5f; border-top: 1.5px solid #1e3a5f;
+  }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 9px; font-weight: 600; }
+  .badge.green { background: #d1fae5; color: #065f46; }
+  .badge.orange { background: #fef3c7; color: #92400e; }
+  .badge.red { background: #fee2e2; color: #991b1b; }
+  .badge.blue { background: #dbeafe; color: #1e40af; }
+  .badge.gray { background: #f3f4f6; color: #4b5563; }
+  .highlight-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+  .hl-card { border-radius: 6px; padding: 7px 9px; text-align: center; color: #fff; border: 1px solid transparent; }
+  .hl-card .hl-label { font-size: 9px; opacity: 0.92; margin-bottom: 2px; }
+  .hl-card .hl-main { font-size: 16px; font-weight: 700; line-height: 1.15; }
+  .hl-card .hl-sub { font-size: 9px; opacity: 0.92; margin-top: 2px; }
+  .hl-card.h1 { background: linear-gradient(135deg, #1e3a5f, #2e5a8f); }
+  .hl-card.h2 { background: linear-gradient(135deg, #059669, #10b981); }
+  .hl-card.h3 { background: linear-gradient(135deg, #d97706, #f59e0b); }
+  .hl-card.h4 { background: linear-gradient(135deg, #0284c7, #38bdf8); }
+  .trend-up { color: #059669; font-weight: 700; }
+  .trend-down { color: #059669; font-weight: 700; }
+  .trend-flat { color: #6b7280; font-weight: 700; }
+  .cmp-table td:first-child { text-align: left; }
+  .cmp-table .cur-val { font-weight: 700; color: #1e3a5f; }
+  .rate-item { display: flex; align-items: center; margin-bottom: 6px; }
+  .rate-item .rl-label { width: 84px; font-size: 10px; color: #4b5563; flex-shrink: 0; }
+  .rate-item .rl-bar {
+    flex: 1; background: #e5e7eb; border-radius: 3px; height: 16px; overflow: hidden; position: relative;
+  }
+  .rate-item .rl-fill {
+    height: 100%; border-radius: 3px; display: flex; align-items: center;
+    justify-content: flex-end; padding-right: 5px; font-size: 9px; color: #fff; font-weight: 700;
+  }
+  .rate-item .rl-fill.g1 { background: linear-gradient(90deg, #10b981, #059669); }
+  .rate-item .rl-fill.g2 { background: linear-gradient(90deg, #3b82f6, #1d4ed8); }
+  .rate-item .rl-fill.g3 { background: linear-gradient(90deg, #f59e0b, #b45309); }
+  .rate-note { font-size: 9px; color: #9ca3af; margin-top: 4px; }
+  .status-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin-bottom: 7px; }
+  .status-card { border: 1px solid #e5e7eb; border-radius: 6px; padding: 6px; text-align: center; background: #fafafa; border-top: 3px solid; }
+  .status-card.s1 { border-top-color: #059669; }
+  .status-card.s2 { border-top-color: #d97706; }
+  .status-card.s3 { border-top-color: #dc2626; }
+  .status-card .s-num { font-size: 18px; font-weight: 700; line-height: 1.05; }
+  .status-card.s1 .s-num { color: #059669; }
+  .status-card.s2 .s-num { color: #d97706; }
+  .status-card.s3 .s-num { color: #dc2626; }
+  .status-card .s-label { font-size: 10px; font-weight: 600; color: #374151; margin-top: 2px; }
+  .status-card .s-desc { font-size: 9px; color: #6b7280; margin-top: 1px; }
+  .note-list { font-size: 10px; color: #374151; line-height: 1.5; list-style: none; padding: 0; }
+  .note-list li { margin-bottom: 2px; padding-left: 4px; }
+  .note-list strong { color: #1e3a5f; }
+  .improve-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+  .improve-card { border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden; }
+  .improve-card .ic-header { padding: 6px 11px; font-size: 11px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 6px; }
+  .improve-card.ic1 .ic-header { background: linear-gradient(90deg, #0284c7, #0369a1); }
+  .improve-card.ic2 .ic-header { background: linear-gradient(90deg, #d97706, #b45309); }
+  .improve-card .ic-body { padding: 7px 10px; font-size: 10px; color: #374151; line-height: 1.5; }
+  .improve-card .ic-body .item { display: flex; margin-bottom: 4px; }
+  .improve-card .ic-body .item:last-child { margin-bottom: 0; }
+  .improve-card .ic-body .item .dot { width: 5px; height: 5px; border-radius: 50%; background: #94a3b8; margin-top: 5px; margin-right: 7px; flex-shrink: 0; }
+  .improve-card .ic-body .item .txt strong { color: #1e3a5f; }
+  .commitment {
+    margin-top: 7px; background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+    border: 1px solid #bae6fd; border-radius: 6px; padding: 7px 11px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  .commitment .c-icon { font-size: 20px; flex-shrink: 0; }
+  .commitment .c-text { font-size: 10px; color: #0c4a6e; line-height: 1.55; }
+  .commitment .c-text strong { color: #075985; }
+  .overview-note {
+    margin-top: 7px; padding: 6px 10px; background: #f8fafc;
+    border: 1px solid #e5e7eb; border-radius: 5px; font-size: 9.5px; color: #4b5563; line-height: 1.6;
+  }
+  .overview-note strong { color: #1e3a5f; }
+  .footer { margin-top: 7px; padding-top: 5px; border-top: 1px solid #e5e7eb; display: flex; justify-content: space-between; font-size: 8.5px; color: #9ca3af; }
+  .footer-page2 { margin-top: 9px; }
+</style>
+</head>
+<body>
+
+<!-- ==================== 第1页 ==================== -->
+<div class="header">
+  <div class="header-left">
+    <h1>__CLIENT_NAME__ · 物流快递__REPORT_TYPE__</h1>
+    <div class="sub">__PERIOD_LABEL__</div>
+  </div>
+  <div class="header-right">
+    <div class="badge">客户专属报告</div>
+    <div class="date">报告出具日期：__REPORT_DATE__</div>
+  </div>
+</div>
+
+<div class="kpi-grid">
+  <div class="kpi-card c1">
+    <div class="label">__KPI1_LABEL__</div>
+    <div class="value">__KPI1_VALUE__</div>
+    <div class="unit">__KPI1_UNIT__</div>
+  </div>
+  <div class="kpi-card c2">
+    <div class="label">__KPI2_LABEL__</div>
+    <div class="value">__KPI2_VALUE__</div>
+    <div class="unit">__KPI2_UNIT__</div>
+  </div>
+  <div class="kpi-card c3">
+    <div class="label">__KPI3_LABEL__</div>
+    <div class="value">__KPI3_VALUE__</div>
+    <div class="unit">__KPI3_UNIT__</div>
+  </div>
+  <div class="kpi-card c4">
+    <div class="label">__KPI4_LABEL__</div>
+    <div class="value">__KPI4_VALUE__</div>
+    <div class="unit">__KPI4_UNIT__</div>
+  </div>
+</div>
+
+<!-- 一、数据改善对比 -->
+<div class="section">
+  <div class="section-title"><span class="num">1</span>__CMP_TITLE__<span class="line"></span></div>
+  <div class="highlight-grid">
+    <div class="hl-card h1">
+      <div class="hl-label">__HL1_LABEL__</div>
+      <div class="hl-main">__HL1_MAIN__</div>
+      <div class="hl-sub">__HL1_SUB__</div>
+    </div>
+    <div class="hl-card h2">
+      <div class="hl-label">__HL2_LABEL__</div>
+      <div class="hl-main">__HL2_MAIN__</div>
+      <div class="hl-sub">__HL2_SUB__</div>
+    </div>
+    <div class="hl-card h3">
+      <div class="hl-label">__HL3_LABEL__</div>
+      <div class="hl-main">__HL3_MAIN__</div>
+      <div class="hl-sub">__HL3_SUB__</div>
+    </div>
+    <div class="hl-card h4">
+      <div class="hl-label">__HL4_LABEL__</div>
+      <div class="hl-main">__HL4_MAIN__</div>
+      <div class="hl-sub">__HL4_SUB__</div>
+    </div>
+  </div>
+  <table class="cmp-table">
+    <thead>
+      <tr><th>指标</th><th>__PREV_LABEL__</th><th>__CUR_LABEL__</th><th>变化</th></tr>
+    </thead>
+    <tbody>
+__COMPARISON_ROWS__
+    </tbody>
+  </table>
+  <div class="rate-note">__CMP_NOTE__</div>
+</div>
+
+<!-- 二、时效达成情况 -->
+<div class="section">
+  <div class="section-title"><span class="num">2</span>时效达成情况<span class="line"></span></div>
+  <div class="two-col">
+    <div>
+      <div class="col-title">分级时效达成率（__CUR_LABEL__）</div>
+      <div class="rate-item">
+        <span class="rl-label">24小时内签收</span>
+        <div class="rl-bar"><div class="rl-fill g1" style="width:__RATE24_W__%">__RATE24__</div></div>
+      </div>
+      <div class="rate-item">
+        <span class="rl-label">48小时内签收</span>
+        <div class="rl-bar"><div class="rl-fill g2" style="width:__RATE48_W__%">__RATE48__</div></div>
+      </div>
+      <div class="rate-item">
+        <span class="rl-label">72小时内签收</span>
+        <div class="rl-bar"><div class="rl-fill g1" style="width:__RATE72_W__%">__RATE72__</div></div>
+      </div>
+      <div class="rate-item">
+        <span class="rl-label">超72小时签收</span>
+        <div class="rl-bar"><div class="rl-fill g3" style="width:__RATE72OVER_W__%">__RATE72OVER__</div></div>
+      </div>
+      <div class="rate-note">__TIMING_NOTE__</div>
+    </div>
+    <div>
+      <div class="col-title">签收时效分布（__CUR_LABEL__）</div>
+      <table>
+        <thead><tr><th>时效段</th><th>单数</th><th>占比</th><th>累计达成</th></tr></thead>
+        <tbody>
+__TIMING_TABLE__
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 三、异常件处理情况（概览） -->
+<div class="section">
+  <div class="section-title"><span class="num">3</span>异常件处理情况<span class="line"></span></div>
+  <div class="status-grid">
+__STATUS_CARDS__
+  </div>
+  <div class="col-title">异常类型明细</div>
+  <table>
+    <thead><tr><th class="text-left">异常类型</th><th>单数</th><th>占比</th><th>类别</th><th class="text-left">异常类型</th><th>单数</th><th>占比</th><th>类别</th></tr></thead>
+    <tbody>
+__EXCEPTION_TABLE__
+    </tbody>
+  </table>
+</div>
+
+<div class="footer">
+  <span>__DATA_SOURCE__ ｜ 本报告由物流运营团队出具</span>
+  <span>第1页/共2页 · __PAGE_FOOTER_DATE__</span>
+</div>
+
+<!-- ==================== 第2页 ==================== -->
+<div class="page-break"></div>
+
+<!-- 四、时效达成明细 -->
+<div class="section" style="margin-top:0;">
+  <div class="section-title"><span class="num">4</span>时效达成明细<span class="line"></span></div>
+  <div class="two-col">
+    <div>
+      <div class="col-title">__TIME_GRANULARITY__时效表现</div>
+      <table>
+        <thead><tr>__DAILY_TIME_HEADER__</tr></thead>
+        <tbody>
+__DAILY_TIME_TABLE__
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <div class="col-title">主要省份签收情况</div>
+      <table>
+        <thead><tr><th class="text-left">省份</th><th>运单</th><th>已签</th><th>签收率</th><th>状态</th></tr></thead>
+        <tbody>
+__PROVINCE_TABLE__
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 五、异常件处理（续） -->
+<div class="section">
+  <div class="section-title"><span class="num">5</span>异常件处理情况（续）<span class="line"></span></div>
+  <div class="two-col">
+    <div>
+      <div class="col-title">异常件__EXC_GRANULARITY__分布</div>
+      <table>
+        <thead><tr>__EXC_DAILY_HEADER__</tr></thead>
+        <tbody>
+__EXC_DAILY_TABLE__
+        </tbody>
+      </table>
+      <div class="rate-note">__EXC_DAILY_NOTE__</div>
+    </div>
+    <div>
+      <div class="col-title">重点异常件说明</div>
+      <ul class="note-list">
+__EXC_NOTES__
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- 六、改善方案与服务承诺 -->
+<div class="section">
+  <div class="section-title"><span class="num">6</span>改善方案与服务承诺<span class="line"></span></div>
+  <div class="improve-grid">
+    <div class="improve-card ic1">
+      <div class="ic-header">⏱ 时效提升方向</div>
+      <div class="ic-body">
+__IMPROVE_TIME__
+      </div>
+    </div>
+    <div class="improve-card ic2">
+      <div class="ic-header">⚠ 异常件改善方向</div>
+      <div class="ic-body">
+__IMPROVE_EXC__
+      </div>
+    </div>
+  </div>
+  <div class="commitment">
+    <div class="c-icon">🤝</div>
+    <div class="c-text">
+      <strong>服务承诺：</strong>我们将持续跟踪上述改善措施的落地效果，下期报告中同步整改进展。如贵司对任何快件有疑问，可随时联系专属客服，我们将在<strong>2小时内</strong>响应并提供详细轨迹说明。感谢贵司的信任与支持！
+    </div>
+  </div>
+</div>
+
+<!-- 概况注 -->
+<div class="overview-note">
+__OVERVIEW_NOTE__
+</div>
+
+<div class="footer footer-page2">
+  <span>__DATA_SOURCE__ ｜ 本报告由物流运营团队出具</span>
+  <span>第2页/共2页 · __PAGE_FOOTER_DATE__</span>
+</div>
+
+</body>
+</html>
