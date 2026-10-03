@@ -1,886 +1,1116 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-物流周报/月报自动生成器（含本期 vs 上期对比）
+"""Auditable customer logistics reports from shipment-level Excel exports."""
 
-用法（周报）：
-  python3 build_report.py --current 本周明细.xlsx --previous 上周明细.xlsx \
-      --client 卡乐 --output ./out
-
-用法（月报）：多份周文件聚合为一个月，并与上月对比
-  python3 build_report.py --mode monthly \
-      --current 8月第1周.xlsx,8月第2周.xlsx,8月第3周.xlsx,8月第4周.xlsx \
-      --previous 7月第1周.xlsx,7月第2周.xlsx,... \
-      --client 卡乐 --output ./out
-
-参数：
-  --current  本期明细Excel（多个用逗号分隔，monthly下聚合为一个月）
-  --previous 上期明细Excel（可选；不传则输出不含对比的"本期概览"版）
-  --mode     weekly(默认) | monthly
-  --client   客户名称（默认"客户"）
-  --period-label  周期标签（如"2026年8月24日—8月29日"）；不传则从数据日期自动推断
-  --report-date   报告出具日期（默认今天）
-  --output   输出目录（默认 ./logistics_report_out）
-  --skip-pdf 只生成HTML不转PDF
-
-输出：同目录下 .html 与 .pdf，脚本打印 PDF 绝对路径。
-依赖：pandas, numpy, openpyxl；Chrome 用于转 PDF。
-"""
-
+from __future__ import annotations
 import argparse
+import calendar
+import copy
 import datetime as dt
-import os
+import html
+import hashlib
+import json
+import math
+from pathlib import Path
 import re
-import subprocess
 import sys
-
+import uuid
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
+from report_core import analyze, load_config, load_many, resolve_files
+from report_delivery import artifact_basename, find_chrome, to_pdf, write_json_atomic
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "assets")
-TEMPLATE_PATH = os.path.join(ASSETS_DIR, "template_report.html")
-
-CHROME_CANDIDATES = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    "google-chrome", "chromium", "chrome", "chromium-browser",
-]
-
-# ---------- 常量 ----------
-WEIGHT_BINS = [0, 10, 100, 300, np.inf]
-WEIGHT_LABELS = ["1-10kg", "11-100kg", "101-300kg", "301kg+"]
-TIME_BINS = [0, 24, 48, 72, 96, np.inf]
+VERSION = "2.0.0"
+TEMPLATE_PATH = (
+    Path(__file__).resolve().parent.parent / "assets" / "template_report.html"
+)
 TIME_LABELS = ["24h内", "24-48h", "48-72h", "72-96h", "96h以上"]
 
-# 异常备注关键词分类（顺序重要，第一条命中即归类）
-# "在途正常"列最前：派送途中/中转中等属正常在途状态，不计入异常
-EXCEPTION_RULES = [
-    ("在途正常", ["派送途中", "派件途中", "转运途中", "正常中转", "中转中", "已到达派件站点", "已交接派件站点", "已到达派件", "运输中", "在途"]),
-    ("目的分拨中转延迟", ["分拨", "中转", "分批", "移货"]),
-    ("未赶上清仓时间", ["清仓"]),
-    ("缺送货单/无单证", ["送货单", "单证", "缺单", "无单"]),
-    ("送货前需预约", ["需预约", "提前预约", "到货预约", "需要预约", "预约今日", "预约收货"]),
-    ("客户预约延迟", ["周末", "休息", "不收货", "放假", "周一派", "明天派", "下周一"]),
-    ("时效顺延", ["顺延", "次日", "二派", "第二", "明天送", "明天再派", "未派送"]),
-    ("网点异常/盘点", ["网点异常", "盘点", "网点停业", "营业异常"]),
-]
-OTHER_LABEL = "其他异常"
-IN_TRANSIT_LABEL = "在途正常"
 
-# 状态卡三分组
-STATUS_GROUP_GOOD = ["客户预约延迟"]              # 绿：客户约定
-STATUS_GROUP_LATENCY = ["未赶上清仓时间", "目的分拨中转延迟", "时效顺延"]  # 橙：物流环节
-STATUS_GROUP_OP = ["缺送货单/无单证", "送货前需预约", "网点异常/盘点"]  # 红：单证及操作异常
-STATUS_GROUP_OTHER = [OTHER_LABEL]
+def esc(value):
+    return html.escape(str(value), quote=True)
 
 
-# ---------- 数据读取 ----------
-def find_remark_col(cols):
-    for c in ["备注", "Unnamed: 10", "说明", "note", "备注说明"]:
-        if c in cols:
-            return c
-    for c in cols:
-        if isinstance(c, str) and "备注" in c:
-            return c
-    return None
+def short(value, length=90):
+    text = " ".join(str(value).split())
+    return text if len(text) <= length else text[: length - 1] + "…"
 
 
-def load_excel(path):
-    """读取单个 Excel 明细文件，返回规范化 DataFrame。"""
-    df = pd.read_excel(path)
-    cols = list(df.columns)
-    # 定位列（兼容不同命名）
-    def pick(*names):
-        for n in names:
-            if n in cols:
-                return n
+def num(value, digits=0, unit=""):
+    return "—" if value is None or pd.isna(value) else f"{value:,.{digits}f}{unit}"
+
+
+def pct(value):
+    return num(value, 1, "%")
+
+
+def json_value(value):
+    if isinstance(value, pd.DataFrame):
+        return json_value(value.to_dict(orient="records"))
+    if isinstance(value, pd.Series):
+        return json_value(value.to_dict())
+    if isinstance(value, dict):
+        return {str(k): json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_value(v) for v in value]
+    if value is pd.NaT or value is pd.NA:
         return None
-
-    waybill = pick("运单号", "运单编号", "单号", "订单号")
-    ship_t = pick("寄件时间", "发货时间", "下单时间", "寄件日期")
-    sign_t = pick("签收时间", "收货时间")
-    prov = pick("目的省份", "省份", "目的省", "收件省份")
-    pieces = pick("件数", "总件数", "件数/重量")
-    act_w = pick("实际重量", "重量", "实际重")
-    vol = pick("体积", "体积重量", "体积重")
-    settle_w = pick("结算重量", "计费重量", "结算重", "计费重")
-    remark = find_remark_col(cols)
-
-    out = pd.DataFrame()
-    out["运单号"] = df[waybill].astype(str) if waybill else pd.Series([""] * len(df))
-    out["寄件时间"] = pd.to_datetime(df[ship_t], errors="coerce") if ship_t else pd.NaT
-    out["签收时间"] = pd.to_datetime(df[sign_t], errors="coerce") if sign_t else pd.NaT
-    out["目的省份"] = (df[prov].astype(str).str.strip() if prov else pd.Series([""] * len(df)))
-    out["件数"] = pd.to_numeric(df[pieces], errors="coerce").fillna(1) if pieces else pd.Series(1.0, index=df.index)
-    out["实际重量"] = pd.to_numeric(df[act_w], errors="coerce").fillna(0) if act_w else pd.Series(0.0, index=df.index)
-    out["结算重量"] = pd.to_numeric(df[settle_w], errors="coerce").fillna(out["实际重量"]) if settle_w else out["实际重量"]
-    out["体积"] = pd.to_numeric(df[vol], errors="coerce").fillna(0) if vol else pd.Series(0.0, index=df.index)
-    out["备注"] = (df[remark].astype(str).str.strip() if remark else pd.Series([""] * len(df)))
-    out["已签收"] = out["签收时间"].notna()
-    out["时效"] = np.where(out["已签收"], (out["签收时间"] - out["寄件时间"]).dt.total_seconds() / 3600.0, np.nan)
-    out = out.dropna(subset=["寄件时间"])
-    out.attrs["has_pieces"] = pieces is not None
-    out.attrs["has_volume"] = vol is not None
-    return out
+    if isinstance(value, (pd.Timestamp, dt.datetime, dt.date)):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return json_value(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
-def load_many(paths):
-    frames = [load_excel(p) for p in paths]
-    return pd.concat(frames, ignore_index=True)
+def parse_as_of(value, timezone):
+    stamp = pd.Timestamp(value) if value else pd.Timestamp.now(tz=timezone)
+    if pd.isna(stamp):
+        raise ValueError("统计截止时刻无效")
+    return (
+        stamp.tz_localize(timezone)
+        if stamp.tzinfo is None
+        else stamp.tz_convert(timezone)
+    )
 
 
-def resolve_files(spec):
-    """支持逗号分隔的多个文件路径，或一个目录（取其中所有 xlsx/xls）。"""
-    if not spec:
+def read_json(path):
+    def reject(value):
+        raise ValueError(f"JSON不允许非有限数值：{value}")
+
+    return json.loads(Path(path).read_text(encoding="utf-8"), parse_constant=reject)
+
+
+def validate_snapshot(saved):
+    if (
+        not isinstance(saved, dict)
+        or not isinstance(saved.get("period"), dict)
+        or not isinstance(saved.get("metrics"), dict)
+        or not isinstance(saved.get("actions", []), list)
+        or not saved.get("as_of")
+    ):
+        raise ValueError("上期快照结构不完整")
+    values = saved["metrics"]
+    fields = {
+        "运单数",
+        "总件数",
+        "实际重量",
+        "签收率",
+        "sla_rate",
+        "72h率",
+        "平均时效",
+        "物流异常单数",
+        "物流异常率",
+        "省份数",
+        "已签收单数",
+        "客户约定单数",
+        "sla_eligible",
+        "sla_ontime",
+        "sla_overdue_unsigned",
+        "sla_pending",
+        "sla_precision_excluded",
+        "sla_invalid_excluded",
+        "review_count",
+        "签收字段覆盖票数",
+        "备注字段覆盖票数",
+    }
+    missing = fields - set(values)
+    if missing:
+        raise ValueError("上期快照缺少必需指标：" + ", ".join(sorted(missing)))
+    nullable = {
+        "总件数",
+        "实际重量",
+        "签收率",
+        "sla_rate",
+        "72h率",
+        "平均时效",
+        "物流异常率",
+    }
+    for key in fields:
+        value = values[key]
+        if value is None and key in nullable:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"上期指标{key}无效")
+        if (key.endswith("率") or key == "sla_rate") and value > 100:
+            raise ValueError(f"上期指标{key}超出百分率范围")
+        if key not in nullable and value != int(value):
+            raise ValueError(f"上期计数{key}必须为整数")
+    total = values["运单数"]
+    if values["签收字段覆盖票数"] > total or values["备注字段覆盖票数"] > total:
+        raise ValueError("上期字段覆盖票数超过运单总数")
+    if (
+        values["已签收单数"] > total
+        or values["物流异常单数"] + values["客户约定单数"] + values["review_count"]
+        > total
+    ):
+        raise ValueError("上期快照计数超过运单总数")
+    if (
+        sum(
+            values[key]
+            for key in (
+                "sla_eligible",
+                "sla_pending",
+                "sla_precision_excluded",
+                "sla_invalid_excluded",
+            )
+        )
+        != total
+        or values["sla_ontime"] + values["sla_overdue_unsigned"]
+        > values["sla_eligible"]
+    ):
+        raise ValueError("上期SLA分子分母不一致")
+    for key, numerator, denominator in (
+        (
+            "签收率",
+            values["已签收单数"],
+            total if values["签收字段覆盖票数"] == total else 0,
+        ),
+        (
+            "物流异常率",
+            values["物流异常单数"],
+            total if values["备注字段覆盖票数"] == total else 0,
+        ),
+        ("sla_rate", values["sla_ontime"], values["sla_eligible"]),
+    ):
+        expected = numerator / denominator * 100 if denominator else None
+        actual = values[key]
+        if (expected is None) != (actual is None) or (
+            expected is not None and abs(actual - expected) > 1e-6
+        ):
+            raise ValueError(f"上期指标{key}与分子分母不一致")
+    if not all(
+        isinstance(a, dict)
+        and isinstance(a.get("waybill"), str)
+        and a.get("status") in {"pending", "in_progress", "closed"}
+        for a in saved.get("actions", [])
+    ):
+        raise ValueError("上期处理台账结构无效")
+    for key in ("start", "end", "mode"):
+        if not isinstance(saved["period"].get(key), str):
+            raise ValueError("上期快照周期结构无效")
+
+
+def select_period(df, mode, start=None, end=None):
+    hi = df["寄件时间"].max().date()
+    if mode == "monthly":
+        anchor = dt.date.fromisoformat(start or end) if start or end else hi
+        first = anchor.replace(day=1)
+        last = anchor.replace(day=calendar.monthrange(anchor.year, anchor.month)[1])
+    else:
+        first = hi - dt.timedelta(days=hi.weekday())
+        last = first + dt.timedelta(days=6)
+    first = dt.date.fromisoformat(start) if start else first
+    last = dt.date.fromisoformat(end) if end else last
+    if first > last:
+        raise ValueError("统计开始日期不得晚于结束日期")
+    if mode == "weekly" and (last - first).days > 6:
+        raise ValueError("周报统计窗口最多7天，请拆分数据或使用月报")
+    if mode == "monthly" and (first.year, first.month) != (last.year, last.month):
+        raise ValueError("月报仅支持同一自然月，请拆分文件")
+    inside = df["寄件时间"].dt.date.between(first, last)
+    if not (start or end) and not inside.all():
+        raise ValueError(
+            "数据跨越统计周期，请指定--period-start/--period-end或拆分文件"
+        )
+    result = df.loc[inside].copy()
+    result.attrs = copy.deepcopy(df.attrs)
+    quality = result.attrs.setdefault("quality", {})
+    quality.update(outside_period_rows=int((~inside).sum()), selected_rows=len(result))
+    if result.empty:
+        raise ValueError("指定统计周期内没有有效运单")
+    return result, first, last
+
+
+def load_actions(path):
+    if not path:
         return []
-    if os.path.isdir(spec):
-        return sorted([os.path.join(spec, f) for f in os.listdir(spec)
-                       if f.lower().endswith((".xlsx", ".xls"))])
-    return [p.strip() for p in spec.split(",") if p.strip()]
+    data = read_json(path)
+    records = data.get("actions") if isinstance(data, dict) else data
+    if not isinstance(records, list):
+        raise ValueError("处理台账应为JSON数组或包含actions数组的对象")
+    aliases = {"待处理": "pending", "处理中": "in_progress", "已闭环": "closed"}
+    result, seen = [], set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("处理台账每项必须是对象")
+        wb = str(record.get("waybill", record.get("运单号", ""))).strip()
+        status = aliases.get(record.get("status"), record.get("status"))
+        if not wb or wb in seen:
+            raise ValueError("处理台账运单号不得为空或重复")
+        if status not in {"pending", "in_progress", "closed"}:
+            raise ValueError(f"运单{wb}的处理状态无效")
+        item = {"waybill": wb, "status": status}
+        for field in ("owner", "due_at", "evidence", "note"):
+            item[field] = str(record.get(field) or "").strip()
+        if item["due_at"]:
+            try:
+                if pd.isna(pd.Timestamp(item["due_at"])):
+                    raise ValueError("empty date")
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"运单{wb}的预计完成时间无效") from exc
+        item["verified_closed"] = status == "closed" and bool(item["evidence"])
+        seen.add(wb)
+        result.append(item)
+    return result
 
 
-# ---------- 分析 ----------
-def classify_exception(text):
-    if not text:
-        return None
-    for label, kws in EXCEPTION_RULES:
-        if any(k in text for k in kws):
-            return label
-    return OTHER_LABEL
+def action_summary(actions, previous, as_of, timezone):
+    if not actions:
+        return "未提供处理台账；仅统计异常记录，不推断已处理或已闭环。"
+    closed = sum(a["verified_closed"] for a in actions)
+    overdue = sum(
+        bool(a["due_at"])
+        and not a["verified_closed"]
+        and parse_as_of(a["due_at"], timezone) < as_of
+        for a in actions
+    )
+    text = f"台账{len(actions)}票：有闭环证据{closed}票，未闭环{len(actions) - closed}票，逾期{overdue}票。"
+    old = {str(a.get("waybill")): a for a in previous}
+    if old:
+        changed = sum(
+            a["waybill"] in old
+            and (
+                a["status"] != old[a["waybill"]].get("status")
+                or a["evidence"] != old[a["waybill"]].get("evidence", "")
+            )
+            for a in actions
+        )
+        absent = len(set(old) - {a["waybill"] for a in actions})
+        text += f"较上期{changed}票状态或证据更新，{absent}票未提供本期更新。"
+    return text
 
 
-def is_date_granularity(df):
-    """寄件时间是否都是日期粒度（时分秒全为0）"""
-    if df.empty:
-        return False
-    t = df["寄件时间"].dt
-    return bool(((t.hour == 0) & (t.minute == 0) & (t.second == 0)).all())
-
-
-def analyze(df):
-    """对一张规范化明细表做全量分析，返回 dict。"""
-    res = {}
-    total = len(df)
-    res["运单数"] = total
-    res["总件数"] = int(df["件数"].sum())
-    res["实际重量"] = float(df["实际重量"].sum())
-    res["结算重量"] = float(df["结算重量"].sum())
-    res["体积"] = float(df["体积"].sum())
-    res["泡货率"] = float((df["结算重量"] > df["实际重量"]).mean() * 100) if total else 0
-    res["省份数"] = int(df[df["目的省份"].astype(str).str.len() > 0]["目的省份"].nunique())
-    res["日期粒度"] = is_date_granularity(df)
-    res["件数按单计"] = not df.attrs.get("has_pieces", True)
-
-    # 每日发货
-    ship_date = df["寄件时间"].dt.normalize()
-    daily = df.groupby(ship_date).agg(
-        运单=("运单号", "count"), 件数=("件数", "sum"), 重量=("实际重量", "sum")).reset_index()
-    daily.columns = ["日期", "运单", "件数", "重量"]
-    res["daily"] = daily
-
-    # 省份分布
-    prov_df = df.groupby("目的省份").agg(运单=("运单号", "count")).reset_index()
-    prov_df = prov_df[prov_df["目的省份"].astype(str).str.len() > 0]
-    prov_df = prov_df.sort_values("运单", ascending=False)
-    res["province"] = prov_df
-
-    # 重量段
-    wd = df.copy()
-    wd["重量段"] = pd.cut(wd["实际重量"], bins=WEIGHT_BINS, labels=WEIGHT_LABELS, right=True)
-    res["weight_dist"] = wd["重量段"].value_counts().reindex(WEIGHT_LABELS, fill_value=0)
-
-    # 签收
-    signed = df[df["已签收"]]
-    res["已签收单数"] = len(signed)
-    res["签收率"] = len(signed) / total * 100 if total else 0
-    res["未签收"] = total - len(signed)
-    # 统计截止日 & 期末在途截点（截止日前1天内发出的未签收件，多属正常在途）
-    end_day = df["寄件时间"].max().normalize() if total else None
-    res["期末日"] = end_day
-    if end_day is not None:
-        cutoff = end_day - pd.Timedelta(days=1)
-        recent_unship = df[(df["寄件时间"].dt.normalize() >= cutoff) & (~df["已签收"])]
-        res["prov_recent_unship"] = recent_unship.groupby("目的省份").size().to_dict()
-        res["期末截点在途"] = int(len(recent_unship))
-    else:
-        res["prov_recent_unship"] = {}
-        res["期末截点在途"] = 0
-    if len(signed):
-        res["平均时效"] = float(signed["时效"].mean())
-        res["中位时效"] = float(signed["时效"].median())
-        res["最快时效"] = float(signed["时效"].min())
-        res["最慢时效"] = float(signed["时效"].max())
-        signed_c = signed.copy()
-        signed_c["时效段"] = pd.cut(signed_c["时效"], bins=TIME_BINS, labels=TIME_LABELS, right=True)
-        dist = signed_c["时效段"].value_counts().reindex(TIME_LABELS, fill_value=0)
-        res["时效分布"] = {k: int(v) for k, v in dist.items()}
-        res["24h率"] = dist["24h内"] / len(signed) * 100
-        res["48h率"] = (dist["24h内"] + dist["24-48h"]) / len(signed) * 100
-        res["72h率"] = (dist["24h内"] + dist["24-48h"] + dist["48-72h"]) / len(signed) * 100
-        # 每日时效
-        dt_daily = signed.groupby(signed["寄件时间"].dt.normalize())["时效"].agg(
-            ["count", "mean", "min", "max"])
-        res["daily_time"] = dt_daily.reset_index()
-        res["daily_time"].columns = ["日期", "已签收", "平均", "最快", "最慢"]
-    else:
-        res["平均时效"] = res["中位时效"] = res["最快时效"] = res["最慢时效"] = 0
-        res["24h率"] = res["48h率"] = res["72h率"] = 0
-        res["时效分布"] = {k: 0 for k in TIME_LABELS}
-        res["daily_time"] = pd.DataFrame(columns=["日期", "已签收", "平均", "最快", "最慢"])
-
-    # 异常件分类
-    exc = df[df["备注"].astype(str).str.len() > 0].copy()
-    exc["异常类型"] = exc["备注"].apply(classify_exception)
-    exc = exc[exc["异常类型"].notna()]
-    # 正常在途状态（派送途中/中转中等）不计入异常
-    res["在途正常数"] = int((exc["异常类型"] == IN_TRANSIT_LABEL).sum())
-    exc = exc[exc["异常类型"] != IN_TRANSIT_LABEL]
-    res["异常表"] = exc
-    exc_dist = exc["异常类型"].value_counts().to_dict()
-    res["异常分布"] = exc_dist
-    res["异常单数"] = int(len(exc))
-    # 状态卡三组
-    def grp_sum(group):
-        return sum(exc_dist.get(k, 0) for k in group)
-    res["异常_客户约定"] = grp_sum(STATUS_GROUP_GOOD)
-    res["异常_物流环节"] = grp_sum(STATUS_GROUP_LATENCY)
-    res["异常_单证操作"] = grp_sum(STATUS_GROUP_OP)
-    res["异常_其他"] = grp_sum(STATUS_GROUP_OTHER)
-    res["异常率"] = res["异常单数"] / total * 100 if total else 0
-
-    # 异常逐日
-    if len(exc):
-        exc_daily = exc.groupby(exc["寄件时间"].dt.normalize()).size().reset_index(name="异常").rename(columns={"寄件时间": "日期"})
-        total_daily = df.groupby(df["寄件时间"].dt.normalize()).size().reset_index(name="当日总单").rename(columns={"寄件时间": "日期"})
-        merged = pd.merge(exc_daily, total_daily, on="日期", how="outer").fillna(0)
-        merged["异常"] = merged["异常"].astype(int)
-        merged["当日总单"] = merged["当日总单"].astype(int)
-        merged["异常率"] = merged["异常"] / merged["当日总单"] * 100
-        merged = merged.sort_values("日期")
-        res["exc_daily"] = merged
-    else:
-        res["exc_daily"] = pd.DataFrame(columns=["日期", "异常", "当日总单", "异常率"])
-
-    return res
-
-
-def monthly_week_bucket(ser):
-    """把日期系列映射为月内周（1-7→第1周 ...）"""
-    day = ser.dt.day
-    w = ((day - 1) // 7) + 1
-    return "第%d周" % w
-
-
-def aggregate_daily_to_weekly(daily_df):
-    """把每日维度表聚合为周维度表（月报用）。daily_df 需含 日期 列"""
-    df = daily_df.copy()
-    df["周"] = df["日期"].apply(lambda d: "第%d周" % ((d.day - 1) // 7 + 1))
-    return df
-
-
-# ---------- HTML 片段生成 ----------
-def pct(v):
-    return "%.1f%%" % v
-
-
-def fmt_num(v, nd=0):
-    if v is None:
-        return "—"
-    return f"{v:,.{nd}f}"
-
-
-def trend_tag(cur, prev, higher_is_better=True):
-    """返回 (方向字符, css class)"""
-    if prev is None:
-        return "本期", "trend-flat"
-    d = cur - prev
-    if abs(d) < 1e-9:
-        return "持平", "trend-flat"
-    good = (d > 0) == higher_is_better
-    if good:
-        return ("▲ +%.1f" % abs(d)) if abs(d) < 20 else ("▲ +%d" % abs(d)), "trend-up"
-    return ("▼ -%.1f" % abs(d)) if abs(d) < 20 else ("▼ -%d" % abs(d)), "trend-worse"
-
-
-def build_comparison(prev, cur):
-    """返回 (title, hl4, rows_html, note)"""
-    rows = []
-    has_prev = prev is not None
-
-    def add(name, cur_v, prev_v, unit="", higher=True, pctmode=False, nd=1):
-        if pctmode:
-            cv = pct(cur_v)
-            pv = pct(prev_v) if has_prev else "—"
-            tag, cls = trend_tag(cur_v, prev_v, higher)
-            if has_prev and prev_v is not None:
-                tag = "▲ +%.1fpp" % (cur_v - prev_v) if (cur_v - prev_v) > 0 else "▼ %.1fpp" % (cur_v - prev_v)
-        else:
-            cv = fmt_num(cur_v, nd) + unit
-            pv = (fmt_num(prev_v, nd) + unit) if has_prev else "—"
-            tag, cls = ("本期", "trend-flat") if not has_prev else ("+%d" % (cur_v - prev_v), "trend-flat")
-        rows.append(
-            f'<tr><td>{name}</td><td>{pv}</td><td class="cur-val">{cv}</td>'
-            f'<td class="{cls}">{tag}</td></tr>')
-
-    add("总运单数", cur["运单数"], prev["运单数"] if has_prev else None, " 单")
-    pieces_note = "*"
-    if has_prev and (cur["件数按单计"] or prev["件数按单计"]):
-        add("总件数", cur["总件数"], prev["总件数"] if has_prev else None, " 件" + pieces_note)
-    else:
-        add("总件数", cur["总件数"], prev["总件数"] if has_prev else None, " 件")
-    add("总实际重量(kg)", cur["实际重量"], prev["实际重量"] if has_prev else None, "", nd=0)
-    add("签收率", cur["签收率"], prev["签收率"] if has_prev else None, pctmode=True)
-    add("24小时签收率", cur["24h率"], prev["24h率"] if has_prev else None, pctmode=True)
-    add("72小时签收率", cur["72h率"], prev["72h率"] if has_prev else None, pctmode=True)
-    avg_note = "*" if (has_prev and (cur["日期粒度"] or prev["日期粒度"])) else ""
-    if has_prev and (cur["日期粒度"] or prev["日期粒度"]):
-        rows.append(f'<tr><td>平均签收时效</td><td>{fmt_num(prev["平均时效"],1)}h{avg_note}</td>'
-                    f'<td class="cur-val">{fmt_num(cur["平均时效"],1)}h{avg_note}</td>'
-                    f'<td class="trend-flat">口径不同</td></tr>')
-    else:
-        add("平均签收时效", cur["平均时效"], prev["平均时效"] if has_prev else None, "h" + avg_note)
-    add("异常件数", cur["异常单数"], prev["异常单数"] if has_prev else None, " 单", higher=False)
-    add("异常件占比", cur["异常率"], prev["异常率"] if has_prev else None, pctmode=True, higher=False)
-    add("覆盖省份", cur["省份数"], prev["省份数"] if has_prev else None, " 个")
-
-    # 高亮4卡
-    if has_prev:
-        d1 = cur["签收率"] - prev["签收率"]
-        h1_main = "%.1f%% → %.1f%%" % (prev["签收率"], cur["签收率"])
-        h1_sub = ("▲ 提升 +%.1f个百分点" % d1) if d1 >= 0 else ("▼ 下降 %.1f个百分点" % abs(d1))
-        d2 = cur["72h率"] - prev["72h率"]
-        h2_main = "%.1f%% → %.1f%%" % (prev["72h率"], cur["72h率"])
-        h2_sub = ("▲ 提升 +%.1f个百分点" % d2) if d2 >= 0 else ("▼ 下降 %.1f个百分点" % abs(d2))
-        de = prev["异常单数"] - cur["异常单数"]
-        h3_main = "%d → %d 单" % (prev["异常单数"], cur["异常单数"])
-        h3_sub = ("▼ 减少 %.1f%%" % (de / prev["异常单数"] * 100)) if prev["异常单数"] and de >= 0 else ("▲ 增加 %d 单" % abs(de))
-        d4 = cur["24h率"] - prev["24h率"]
-        h4_main = "%.1f%% → %.1f%%" % (prev["24h率"], cur["24h率"])
-        h4_sub = ("▲ 提升 +%.1f个百分点" % d4) if d4 >= 0 else ("▼ 下降 %.1f个百分点" % abs(d4))
-        title = "周度数据改善对比" if cur.get("_mode", "weekly") == "weekly" else "月度数据改善对比"
-    else:
-        h1_main = pct(cur["签收率"])
-        h1_sub = "已签收 %d / %d 单" % (cur["已签收单数"], cur["运单数"])
-        h2_main = pct(cur["72h率"])
-        h2_sub = "72小时内签收达成"
-        h3_main = "%d" % cur["异常单数"]
-        h3_sub = "异常件 · 占比 %.1f%%" % cur["异常率"]
-        h4_main = pct(cur["24h率"])
-        h4_sub = "24小时内签收达成"
-        title = "本期核心数据概览"
-
-    hl = [
-        ("签收率", h1_main, h1_sub),
-        ("72小时签收率", h2_main, h2_sub),
-        ("异常件", h3_main, h3_sub),
-        ("24小时签收率", h4_main, h4_sub),
+def comparison(prev, cur, mode, note):
+    specs = [
+        ("总运单数", "运单数", "票", 0, None),
+        ("总件数", "总件数", "件", 0, None),
+        ("实际重量", "实际重量", "kg", 1, None),
+        ("截至截点签收率", "签收率", "%", 1, True),
+        ("到期运单SLA达成率", "sla_rate", "%", 1, True),
+        ("已签收件72h内占比", "72h率", "%", 1, True),
+        ("有效签收平均时效", "平均时效", "h", 1, False),
+        ("物流异常票数", "物流异常单数", "票", 0, False),
+        ("物流异常占比", "物流异常率", "%", 1, False),
+        ("有效目的省份", "省份数", "个", 0, None),
     ]
+    rows = []
+    for label, key, unit, digits, higher in specs:
+        if key == "实际重量" and (
+            cur.get("未知重量票数", 0) or (prev and prev.get("未知重量票数", 0))
+        ):
+            label = "已知实际重量"
+        if key == "总件数" and (
+            cur.get("件数按单计") or (prev and prev.get("件数按单计"))
+        ):
+            label = "总件数（含估算）"
+        if key == "总件数" and (
+            cur.get("未知件数票数", 0) or (prev and prev.get("未知件数票数", 0))
+        ):
+            label = "已知件数（部分缺失）"
+        value, old = cur.get(key), prev.get(key) if prev else None
+        change, style = "—", "trend-flat"
+        if old is not None and value is not None:
+            delta = value - old
+            if abs(delta) < 1e-9:
+                change = "持平"
+            else:
+                change = f"{delta:+.{digits}f}" + ("pp" if unit == "%" else unit)
+                if higher is not None:
+                    style = "trend-up" if (delta > 0) == higher else "trend-worse"
+        rows.append(
+            f'<tr><td>{label}</td><td>{num(old, digits, unit)}</td><td class="cur-val">{num(value, digits, unit)}</td><td class="{style}">{change}</td></tr>'
+        )
+    cards = []
+    for label, key, unit in [
+        ("总运单数", "运单数", "票"),
+        ("到期SLA达成", "sla_rate", "%"),
+        ("截至截点签收率", "签收率", "%"),
+        ("物流异常占比", "物流异常率", "%"),
+    ]:
+        value = num(cur.get(key), 1 if unit == "%" else 0, unit)
+        old = num(prev.get(key), 1 if unit == "%" else 0, unit) if prev else ""
+        cards.append(
+            (
+                label,
+                f"{old} → {value}" if prev else value,
+                "同观察滞后比较" if prev else "分母见口径说明",
+            )
+        )
+    title = (
+        ("月度数据对比" if mode == "monthly" else "周度数据对比")
+        if prev
+        else "本期核心数据概览"
+    )
+    return title, cards, "\n".join(rows), note
 
-    note_parts = []
-    if has_prev and (cur["日期粒度"] or prev["日期粒度"]):
-        note_parts.append("* 本期/上期签收数据含日期粒度统计，平均时效略高于实际，实际时效改善更明显；达成率口径一致。")
-    if pieces_note and has_prev and (cur["件数按单计"] or prev["件数按单计"]):
-        note_parts.append("* 本期/上期源文件缺件数列，总件数按运单数计（每单1件），仅供参考。")
-    if (cur.get("在途正常数", 0) + (prev.get("在途正常数", 0) if has_prev else 0)) > 0:
-        note_parts.append("* 在途状态（派送途中/中转中）属正常流转，未计入异常件。")
-    if has_prev and (cur.get("期末截点在途", 0) > 0 or prev.get("期末截点在途", 0) > 0):
-        note_parts.append("* 本期/上期统计截止日前1天发货较集中，部分快件仍处派送途中，签收率受周期截点影响，实际达成以72h签收率与时效分布为准。")
-    if not has_prev:
-        note_parts.append("* 本期为首次报表，暂无上期对比数据；下期起自动加入环比对比。")
-    if not note_parts:
-        note_parts.append("* 环比口径：与上一统计周期（相同统计天数）对比。")
-    return title, hl, "\n".join(rows), " ".join(note_parts)
+
+def timing(cur):
+    count = sum(cur["时效分布"].values())
+    rows, cumulative = [], 0
+    for label in TIME_LABELS:
+        n = cur["时效分布"].get(label, 0)
+        cumulative += n
+        rows.append(
+            f"<tr><td>{label}</td><td>{n}</td><td>{pct(n / count * 100) if count else '—'}</td><td>{pct(cumulative / count * 100) if count else '—'}</td></tr>"
+        )
+    rows.append(
+        f'<tr class="total-row"><td>有效样本</td><td>{count}</td><td>{"100%" if count else "—"}</td><td>—</td></tr>'
+    )
+    r72 = cur.get("72h率")
+    rates = [
+        cur.get("24h率"),
+        cur.get("48h率"),
+        r72,
+        100 - r72 if r72 is not None else None,
+    ]
+    return (
+        rates,
+        "\n".join(rows),
+        f"基于{count}票有效、精确时间的已签收件；不代表全部运单SLA达成。",
+    )
 
 
-def build_timing(cur):
-    signed_n = cur["已签收单数"]
-    dist = cur["时效分布"]
-    d = dist
-    rates = [cur["24h率"], cur["48h率"], cur["72h率"], 100 - cur["72h率"]]
-    bars = ""
-    for lbl, w, cls in [("24h内", 24, "g1"), ("48h内", 48, "g2"), ("72h内", 72, "g1"), ("超72h", 96, "g3")]:
-        pass
-    r24, r48, r72, rover = rates
-    timing_rows = ""
-    cum = 0
-    for i, lb in enumerate(TIME_LABELS):
-        n = d[lb]
-        cum += n
-        cum_pct = cum / signed_n * 100 if signed_n else 0
-        badge = "green" if cum_pct >= 90 else ("orange" if cum_pct >= 75 else "red")
-        if cum_pct >= 99.95:
-            cum_show = "100%"
-        elif i == len(TIME_LABELS) - 1:
-            cum_show = "100%"
-        else:
-            cum_show = "%.1f%%" % cum_pct
-        timing_rows += (
-            f'<tr><td>{lb}</td><td>{n}</td><td>{pct(n / signed_n * 100) if signed_n else "0%"}</td>'
-            f'<td><span class="badge {badge}">{cum_show}</span></td></tr>')
-    timing_rows += f'<tr class="total-row"><td>合计</td><td>{signed_n}</td><td>100%</td><td>—</td></tr>'
-    note = f"* 基于已签收的{signed_n}单统计，{cur['未签收']}单在途未计入"
-    return r24, r48, r72, rover, timing_rows, note
-
-
-def build_exception(cur):
-    exc = cur["异常表"]
+def exceptions(cur):
     dist = cur["异常分布"]
     cards = [
-        (1, cur["异常_客户约定"], "客户预约延迟", "周末/休息日不收货，属正常约定"),
-        (2, cur["异常_物流环节"], "物流环节延迟", "清仓/分拨中转/时效顺延"),
-        (3, cur["异常_单证操作"], "单证及操作异常", "缺送货单/需预约/网点异常"),
+        (cur.get("异常_客户约定", 0), "客户约定记录", "不自动作SLA豁免"),
+        (cur.get("异常_物流环节", 0), "物流延迟记录", "清仓/中转/顺延"),
+        (cur.get("异常_单证操作", 0), "单证及操作记录", "单证/预约/网点"),
+        (cur.get("异常_其他", 0), "其他异常记录", "需核实事件与处理安排"),
+        (cur.get("review_count", 0), "待复核备注", "未明确语义单独复核"),
     ]
     cards_html = "".join(
-        f'<div class="status-card s{n}"><div class="s-num">{v}</div>'
-        f'<div class="s-label">{l}</div><div class="s-desc">{d}</div></div>'
-        for n, v, l, d in cards)
-
-    order = ["客户预约延迟", "未赶上清仓时间", "目的分拨中转延迟", "时效顺延",
-             "缺送货单/无单证", "送货前需预约", "网点异常/盘点", OTHER_LABEL]
-    total_exc = cur["异常单数"]
-    cells = []
-    first_half = order[:4]
-    second_half = order[4:]
-    row_html = ""
+        f'<div class="status-card s{min(i + 1, 3)}"><div class="s-num">{n}</div><div class="s-label">{label}</div><div class="s-desc">{desc}</div></div>'
+        for i, (n, label, desc) in enumerate(cards)
+    )
+    labels = [
+        "客户预约延迟",
+        "未赶上清仓时间",
+        "目的分拨中转延迟",
+        "时效顺延",
+        "缺送货单/无单证",
+        "送货前需预约",
+        "网点异常/盘点",
+        "其他异常",
+    ]
+    rows, total = [], cur["异常单数"]
     for i in range(4):
-        l1, l2 = first_half[i], second_half[i]
-        v1, v2 = dist.get(l1, 0), dist.get(l2, 0)
-        row_html += (
-            f'<tr>'
-            f'<td class="text-left">{l1}</td><td>{v1}</td><td>{pct(v1 / total_exc * 100) if total_exc else "0%"}</td>'
-            f'<td><span class="badge {"gray" if l1 == "客户预约延迟" else "orange"}">{cat_of(l1)}</span></td>'
-            f'<td class="text-left">{l2}</td><td>{v2}</td><td>{pct(v2 / total_exc * 100) if total_exc else "0%"}</td>'
-            f'<td><span class="badge {exc_badge(l2)}">{cat_of(l2)}</span></td>'
-            f'</tr>')
-    half_sum1 = sum(dist.get(k, 0) for k in first_half)
-    half_sum2 = sum(dist.get(k, 0) for k in second_half)
-    row_html += (
-        f'<tr class="total-row"><td class="text-left">合计</td><td>{half_sum1}</td><td>'
-        f'{pct(half_sum1 / total_exc * 100) if total_exc else "0%"}</td><td>—</td>'
-        f'<td class="text-left">合计</td><td>{half_sum2}</td><td>'
-        f'{pct(half_sum2 / total_exc * 100) if total_exc else "0%"}</td><td>—</td></tr>')
-    return cards_html, row_html
+        cells = []
+        for label in (labels[i], labels[i + 4]):
+            n = dist.get(label, 0)
+            cells.append(
+                f'<td class="text-left">{label}</td><td>{n}</td><td>{pct(n / total * 100) if total else "—"}</td>'
+            )
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    return cards_html, "\n".join(rows)
 
 
-def cat_of(label):
-    if label in STATUS_GROUP_GOOD:
-        return "客户约定"
-    if label in STATUS_GROUP_LATENCY:
-        return "物流环节"
-    if label in STATUS_GROUP_OP:
-        return "单证操作"
-    return "其他"
+def daily_timing(cur, mode, df):
+    data = df.copy()
+    data["分组"] = (
+        data["寄件时间"].dt.day.map(lambda n: f"第{(n - 1) // 7 + 1}周")
+        if mode == "monthly"
+        else data["寄件时间"].dt.strftime("%m/%d")
+    )
+    valid = (
+        data["__time_valid"]
+        & data["签收时间"].notna()
+        & (data["签收时间"] <= cur["as_of"])
+    )
+    rows = []
+    for label, group in data.groupby("分组", sort=True):
+        times = group.loc[valid.loc[group.index], "时效"].dropna()
+        rows.append(
+            f"<tr><td>{label}</td><td>{len(group)}</td><td>{len(times)}</td><td>{num(times.mean() if len(times) else None, 1, 'h')}</td><td>{num(times.max() if len(times) else None, 0, 'h')}</td></tr>"
+        )
+    rows.append(
+        f'<tr class="total-row"><td>合计/平均</td><td>{cur["运单数"]}</td><td>{sum(cur["时效分布"].values())}</td><td>{num(cur["平均时效"], 1, "h")}</td><td>{num(cur["最慢时效"], 0, "h")}</td></tr>'
+    )
+    return (
+        f"<th>{'周次' if mode == 'monthly' else '日期'}</th><th>运单</th><th>有效签收</th><th>平均</th><th>最慢</th>",
+        "\n".join(rows),
+    )
 
 
-def exc_badge(label):
-    if label in STATUS_GROUP_GOOD:
-        return "gray"
-    if label in STATUS_GROUP_LATENCY:
-        return "orange"
-    if label in STATUS_GROUP_OP:
-        return "red"
-    return "blue"
-
-
-def build_daily_time(cur, mode):
-    d = cur["daily_time"]
-    if d.empty:
-        return "", ""
-    if mode == "monthly":
-        df = d.copy()
-        df["周"] = df["日期"].apply(lambda x: "第%d周" % ((x.day - 1) // 7 + 1))
-        g = df.groupby("周").agg(已签收=("已签收", "sum"), 平均=("平均", "mean"),
-                                 最快=("最快", "min"), 最慢=("最慢", "max")).reset_index()
-        header = "<th>周次</th><th>已签收</th><th>平均时效</th><th>最快</th><th>最慢</th>"
-        rows = ""
-        for _, r in g.iterrows():
-            rows += (f'<tr><td>{r["周"]}</td><td>{int(r["已签收"])}</td>'
-                     f'<td>{r["平均"]:.1f}h</td><td>{r["最快"]:.0f}h</td><td>{r["最慢"]:.0f}h</td></tr>')
-        rows += (f'<tr class="total-row"><td>合计/平均</td><td>{int(g["已签收"].sum())}</td>'
-                 f'<td>{cur["平均时效"]:.1f}h</td><td>{cur["最快时效"]:.0f}h</td><td>{cur["最慢时效"]:.0f}h</td></tr>')
-        return header, rows
-    else:
-        header = "<th>日期</th><th>星期</th><th>已签收</th><th>平均时效</th><th>最快</th><th>最慢</th>"
-        rows = ""
-        wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        for _, r in d.iterrows():
-            dd = r["日期"]
-            rows += (f'<tr><td>{dd.month}/{dd.day}</td><td>{wd[dd.weekday()]}</td>'
-                     f'<td>{int(r["已签收"])}</td>'
-                     f'<td>{r["平均"]:.1f}h</td><td>{r["最快"]:.0f}h</td><td>{r["最慢"]:.0f}h</td></tr>')
-        rows += (f'<tr class="total-row"><td colspan="2">合计/平均</td><td>{int(d["已签收"].sum())}</td>'
-                 f'<td>{cur["平均时效"]:.1f}h</td><td>{cur["最快时效"]:.0f}h</td><td>{cur["最慢时效"]:.0f}h</td></tr>')
-        return header, rows
-
-
-def build_province(cur, top_n=8):
-    p = cur["province"]
-    if p.empty:
-        return ""
-    total = cur["运单数"]
-    signed = cur["已签收单数"]
-    p2 = p.head(top_n).copy()
-    p2["已签"] = 0
-    # 按省份签收数
-    exc = cur["异常表"]
-    sign_by_prov = cur_prov_sign(cur)
-    rows = ""
-    for _, r in p2.iterrows():
-        prov = r["目的省份"]
-        n = int(r["运单"])
-        sg = sign_by_prov.get(prov, 0)
-        rate = sg / n * 100 if n else 0
-        # 排除期末在途截点后评估：截止日前1天内发出的未签收件视为正常在途
-        eff_sg = sg + cur.get("prov_recent_unship", {}).get(prov, 0)
-        eff_rate = eff_sg / n * 100 if n else 0
-        if eff_rate >= 98:
-            badge, st = "green", "优秀"
-        elif eff_rate >= 90:
-            badge, st = "green", "良好"
-        elif eff_rate >= 85:
-            badge, st = "orange", "关注"
+def province(cur, target):
+    rows = []
+    table = cur["province"]
+    top = table.head(6)["目的省份"].tolist()
+    risks = sorted(
+        (
+            (name, sla)
+            for name, sla in cur.get("province_sla", {}).items()
+            if sla["eligible"] >= 3 and sla["rate"] is not None and sla["rate"] < target
+        ),
+        key=lambda item: (item[1]["rate"], -item[1]["overdue"]),
+    )
+    for name, _ in risks:
+        if name not in top and len(top) < 8:
+            top.append(name)
+    for name in table["目的省份"]:
+        if name not in top and len(top) < 8:
+            top.append(name)
+    for name in top:
+        item = table.loc[table["目的省份"].eq(name)].iloc[0]
+        name, n = item["目的省份"], int(item["运单"])
+        sla = cur.get("province_sla", {}).get(name, {})
+        rate, eligible = sla.get("rate"), sla.get("eligible", 0)
+        if not eligible or rate is None:
+            status, style = "待观察", "gray"
+        elif eligible < 3:
+            status, style = "样本少", "gray"
+        elif rate >= target:
+            status, style = "参考达标", "green"
         else:
-            badge, st = "red", "重点"
-        rows += (f'<tr><td class="text-left">{prov}</td><td>{n}</td><td>{sg}</td>'
-                 f'<td>{rate:.1f}%</td><td><span class="badge {badge}">{st}</span></td></tr>')
-    rows += (f'<tr class="total-row"><td class="text-left">整体</td><td>{total}</td><td>{signed}</td>'
-             f'<td>{cur["签收率"]:.1f}%</td><td><span class="badge blue">—</span></td></tr>')
-    return rows
+            status, style = "需关注", "orange"
+        rows.append(
+            f'<tr><td class="text-left">{esc(short(name, 12))}</td><td>{n}</td><td>{eligible}</td><td>{pct(rate)}</td><td><span class="badge {style}">{status}</span></td></tr>'
+        )
+    rows.append(
+        f'<tr class="total-row"><td>整体</td><td>{cur["运单数"]}</td><td>{cur.get("sla_eligible", 0)}</td><td>{pct(cur.get("sla_rate"))}</td><td>—</td></tr>'
+    )
+    return "\n".join(rows)
 
 
-def cur_prov_sign(cur):
-    exc = cur["异常表"]
-    # 直接用已签收标记，但 analyze 未保留原始按省份签收。这里从异常表推断不行。
-    # 改为：异常表之外的都算签收会有偏差，改为在 analyze 里额外算省份签收。
-    return cur.get("prov_sign", {})
-
-
-def build_exc_daily(cur, mode):
-    d = cur["exc_daily"]
-    if d.empty:
-        return "", "", "本周无异常件记录，继续保持。"
+def exception_daily(cur, mode):
+    data = cur["exc_daily"].copy()
+    if data.empty:
+        return (
+            "<th>日期</th><th>记录票</th><th>总票数</th><th>占比</th>",
+            '<tr><td colspan="4">未发现已分类异常记录</td></tr>',
+        )
     if mode == "monthly":
-        df = d.copy()
-        df["周"] = df["日期"].apply(lambda x: "第%d周" % ((x.day - 1) // 7 + 1))
-        g = df.groupby("周").agg(异常=("异常", "sum"), 当日总单=("当日总单", "sum")).reset_index()
-        g["异常率"] = g["异常"] / g["当日总单"] * 100
-        header = "<th>周次</th><th>异常单</th><th>当日总单</th><th>异常率</th>"
-        rows = ""
-        for _, r in g.iterrows():
-            rows += (f'<tr><td>{r["周"]}</td><td>{int(r["异常"])}</td><td>{int(r["当日总单"])}</td>'
-                     f'<td>{r["异常率"]:.1f}%</td></tr>')
-        rows += (f'<tr class="total-row"><td colspan="1">合计</td><td>{cur["异常单数"]}</td>'
-                 f'<td>{cur["运单数"]}</td><td>{cur["异常率"]:.1f}%</td></tr>')
-        note = "* 异常集中分布的周次已在右侧重点说明中列出"
-        return header, rows, note
+        data["分组"] = data["日期"].dt.day.map(lambda n: f"第{(n - 1) // 7 + 1}周")
+        data = (
+            data.groupby("分组")
+            .agg(
+                异常=("异常", "sum"),
+                当日总单=("当日总单", "sum"),
+                备注字段覆盖票数=("备注字段覆盖票数", "sum"),
+            )
+            .reset_index()
+        )
     else:
-        header = "<th>日期</th><th>星期</th><th>异常单</th><th>当日总单</th><th>异常率</th>"
-        wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        rows = ""
-        for _, r in d.iterrows():
-            dd = r["日期"]
-            rows += (f'<tr><td>{dd.month}/{dd.day}</td><td>{wd[dd.weekday()]}</td>'
-                     f'<td>{int(r["异常"])}</td><td>{int(r["当日总单"])}</td>'
-                     f'<td>{r["异常率"]:.1f}%</td></tr>')
-        rows += (f'<tr class="total-row"><td colspan="2">合计</td><td>{cur["异常单数"]}</td>'
-                 f'<td>{cur["运单数"]}</td><td>{cur["异常率"]:.1f}%</td></tr>')
-        # 找出异常最集中的日期
-        if len(d):
-            peak = d.sort_values("异常", ascending=False).iloc[0]
-            dd = peak["日期"]
-            note = f"* 异常集中在{wd[dd.weekday()]}（{dd.month}/{dd.day}，{int(peak['异常'])}单），详见右侧说明"
-        else:
-            note = ""
-        return header, rows, note
+        data["分组"] = data["日期"].dt.strftime("%m/%d")
+    rows = "".join(
+        f"<tr><td>{r['分组']}</td><td>{int(r['异常'])}</td><td>{int(r['当日总单'])}</td><td>{pct(r['异常'] / r['当日总单'] * 100) if r['当日总单'] and r['备注字段覆盖票数'] == r['当日总单'] else '—'}</td></tr>"
+        for _, r in data.iterrows()
+    )
+    return (
+        f"<th>{'周次' if mode == 'monthly' else '日期'}</th><th>记录票</th><th>总票数</th><th>占比</th>",
+        rows,
+    )
 
 
-def build_exc_notes(cur, max_items=5):
-    exc = cur["异常表"]
-    if exc.empty:
-        return "<li>• 本期无异常件记录，继续保持。</li>"
-    notes = []
-    # 优先展示含运单号且属于操作/物流问题的关键项
-    priority_kws = ["送货单", "单证", "清仓", "分拨", "中转", "网点", "缺", "异常"]
-    for _, r in exc.iterrows():
-        txt = r["备注"]
-        wb = r["运单号"]
-        if len(notes) >= max_items:
-            break
-        if any(k in txt for k in priority_kws) and wb and wb not in "nan":
-            notes.append(f'<li>• <strong>{r["异常类型"]}</strong>：运单{wb}，{txt}</li>')
-    # 若不足则补充其他
-    if len(notes) < max_items:
-        for _, r in exc.iterrows():
-            if len(notes) >= max_items:
-                break
-            txt = r["备注"]
-            wb = r["运单号"]
-            if any(wb in n for n in notes):
-                continue
-            notes.append(f'<li>• <strong>{r["异常类型"]}</strong>：运单{wb}，{txt}</li>')
-    # 客户预约延迟计数说明
-    n_good = cur["异常_客户约定"]
-    if n_good:
-        notes.append(f'<li>• <strong>周末预约不派送</strong>：共{n_good}单为收件人周末休息，属正常约定</li>')
-    return "\n".join(notes)
+def exception_notes(cur, actions):
+    by_waybill = {a["waybill"]: a for a in actions}
+    rows = []
+    records = cur["异常表"].copy()
+    records["priority"] = (
+        records["异常类型"]
+        .map(
+            {
+                "其他异常": 0,
+                "网点异常/盘点": 1,
+                "缺送货单/无单证": 2,
+                "目的分拨中转延迟": 3,
+            }
+        )
+        .fillna(4)
+    )
+    for _, record in records.sort_values("priority", kind="stable").head(4).iterrows():
+        wb = str(record["运单号"])
+        action = by_waybill.get(wb)
+        state = ""
+        if action:
+            status = (
+                "已闭环（有证据）"
+                if action["verified_closed"]
+                else {
+                    "closed": "闭环待核实",
+                    "pending": "待处理",
+                    "in_progress": "处理中",
+                }[action["status"]]
+            )
+            state = f"；{status}，负责人{short(action['owner'] or '未提供', 10)}"
+        rows.append(
+            f"<li>• <strong>{esc(record['异常类型'])}</strong>：{esc(short(wb, 24))}，{esc(short(record['备注'], 65))}{esc(state)}</li>"
+        )
+    if not rows:
+        rows.append("<li>• 未发现已分类异常记录；缺少备注不等于实际零异常。</li>")
+    if cur.get("review_count", 0):
+        rows.append(f"<li>• 另有{cur['review_count']}票备注待复核，见附件。</li>")
+    return "\n".join(rows)
 
 
-def build_improve(cur):
+def improvements(cur):
     dist = cur["异常分布"]
-    signed_n = cur["已签收单数"]
-    time_items = []
-    if dist.get("未赶上清仓时间", 0) > 0:
-        time_items.append(("清仓衔接优化", "针对%d单未赶上清仓（集中在截单时段），优化截单与网点清仓衔接，确保快件当日发出" % dist["未赶上清仓时间"]))
-    if dist.get("目的分拨中转延迟", 0) > 0:
-        time_items.append(("分拨中转提速", "协调分拨加快货区流转，减少分批中转/未及时移货导致的晚送（%d单）" % dist["目的分拨中转延迟"]))
-    low_prov = [r for _, r in cur["province"].head(10).iterrows()
-                if (cur.get("prov_sign", {}).get(r["目的省份"], 0)
-                    + cur.get("prov_recent_unship", {}).get(r["目的省份"], 0)) / max(r["运单"], 1) < 0.85
-                and r["运单"] >= 3]
-    if low_prov:
-        names = "、".join(r["目的省份"] for r in low_prov[:2])
-        time_items.append(("偏远区域专项跟踪", "%s等线路签收率偏低，建立专项跟踪与末端催派机制" % names))
-    if cur["72h率"] < 98:
-        time_items.append(("72h签收率提升", "本期%.1f%%，对超72h快件逐单跟进，目标提升至98%%" % cur["72h率"]))
-    if len(time_items) < 4:
-        time_items.append(("末端派送时效跟踪", "持续跟踪各线路末端派送时效，动态优化路由安排"))
+    time_items, operation_items = [], []
+    if cur.get("sla_overdue_unsigned", 0):
+        time_items.append(
+            (
+                "到期未签收核查",
+                f"有{cur['sla_overdue_unsigned']}票到期未签收，建议核查轨迹及预计送达时间。",
+            )
+        )
+    if dist.get("其他异常", 0):
+        operation_items.append(
+            ("其他异常核查", "建议逐票核对异常事件、责任和处理安排。")
+        )
+    if dist.get("未赶上清仓时间", 0):
+        time_items.append(
+            ("清仓衔接核查", "发现清仓相关异常备注，建议核实截单与发运衔接。")
+        )
+    if dist.get("目的分拨中转延迟", 0):
+        time_items.append(
+            ("中转轨迹核查", "发现中转延迟记录，建议确认原因及处理安排。")
+        )
+    if not time_items:
+        time_items.append(
+            ("持续观察", "按到期运单与线路时效观察；暂无依据推断具体改善效果。")
+        )
+    if cur.get("review_count", 0):
+        operation_items.append(
+            ("备注复核", f"建议核实{cur['review_count']}票未明确分类的备注。")
+        )
+    if dist.get("缺送货单/无单证", 0):
+        operation_items.append(("单证核对", "建议核对相关运单的随货单证与交接记录。"))
+    if cur.get("异常_客户约定", 0):
+        operation_items.append(
+            ("收货安排确认", "建议确认客户收货约定；时效豁免依据实际服务规则。")
+        )
+    if not operation_items:
+        operation_items.append(
+            ("处理记录维护", "建议更新责任人、预计完成时间与闭环证据，供下期核对。")
+        )
 
-    exc_items = []
-    if dist.get("缺送货单/无单证", 0) > 0:
-        exc_items.append(("单证核对前置", "针对%d单缺送货单，出货前与客户逐票核对随货单证，避免到货无法签收" % dist["缺送货单/无单证"]))
-    if cur["异常_客户约定"] > 0:
-        exc_items.append(("周末派送协同", "针对%d单周末不收货，与客户确认各区域周末收货偏好，提前规划派送安排" % cur["异常_客户约定"]))
-    if dist.get("网点异常/盘点", 0) > 0:
-        exc_items.append(("网点运营排查", "针对网点异常，落实末端网点责任与运营巡检，杜绝同类问题"))
-    if cur["异常单数"] > 0:
-        exc_items.append(("异常件主动告知", "对预计延迟的快件，提前主动联系客户说明情况并告知预计送达时间"))
-    if len(exc_items) < 4:
-        exc_items.append(("零异常保持机制", "建立日常自查机制，持续保持低异常率"))
+    def section(items):
+        return "".join(
+            f'<div class="item"><span class="dot"></span><div class="txt"><strong>{esc(t)}：</strong>{esc(d)}</div></div>'
+            for t, d in items[:2]
+        )
 
-    def to_html(items):
-        return "\n".join(
-            f'<div class="item"><span class="dot"></span><div class="txt"><strong>{t}：</strong>{d}</div></div>'
-            for t, d in items)
-
-    return to_html(time_items), to_html(exc_items)
-
-
-def build_overview(cur, client, mode):
-    daily = cur["daily"]
-    gran = "周" if mode == "monthly" else "日"
-    peak = daily.sort_values("运单", ascending=False).iloc[0] if len(daily) else None
-    top_prov = cur["province"].iloc[0]["目的省份"] if len(cur["province"]) else "—"
-    top_n = int(cur["province"].iloc[0]["运单"]) if len(cur["province"]) else 0
-    parts = []
-    if peak is not None:
-        d = peak["日期"]
-        parts.append("发货高峰为%s（%d单），%s发货量平稳" % (
-            ("第%d周" % ((d.day - 1) // 7 + 1)) if mode == "monthly" else (["周一", "周二", "周三", "周四", "周五", "周六", "周日"][d.weekday()]),
-            int(peak["运单"]), gran))
-    parts.append("%s为第一大目的地（%d单，占比%.1f%%）" % (top_prov, top_n, top_n / cur["运单数"] * 100 if cur["运单数"] else 0))
-    parts.append("覆盖%d个省/直辖市，结算总重量%.0fkg" % (cur["省份数"], cur["结算重量"]))
-    if mode == "monthly":
-        parts.append("月度签收率%.1f%%、72h达成率%.1f%%" % (cur["签收率"], cur["72h率"]))
-    else:
-        parts.append("整体时效达成与异常管控良好" if cur["异常单数"] <= 20 else "整体时效达成良好，异常件有待进一步压降")
-    if cur.get("在途正常数", 0) > 0:
-        parts.append("另有%d单在途正常（派送途中/中转中）" % cur["在途正常数"])
-    return "<strong>%s概况：</strong>%s。" % (client, "；".join(parts))
+    return section(time_items), section(operation_items)
 
 
-# ---------- 主流程 ----------
-def infer_period_label(df, mode):
-    if df.empty:
-        return ""
-    lo = df["寄件时间"].min()
-    hi = df["寄件时间"].max()
-    if mode == "monthly":
-        if lo.year == hi.year and lo.month == hi.month:
-            return "%d年%d月" % (lo.year, lo.month)
-        return "%d年%d月 — %d年%d月" % (lo.year, lo.month, hi.year, hi.month)
-    wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    s = "%d年%d月%d日 — %d月%d日（%s至%s）" % (
-        lo.year, lo.month, lo.day, hi.month, hi.day, wd[lo.weekday()], wd[hi.weekday()])
-    return s
+def overview(cur, mode, df):
+    key = (
+        df["寄件时间"].dt.day.map(lambda n: f"第{(n - 1) // 7 + 1}周")
+        if mode == "monthly"
+        else df["寄件时间"].dt.strftime("%m/%d")
+    )
+    groups = df.groupby(key).size()
+    tied = int(groups.eq(groups.max()).sum()) if len(groups) else 0
+    peak = (
+        f"发货高峰{groups.idxmax()}（{int(groups.max())}票）"
+        if tied == 1
+        else f"{'周' if mode == 'monthly' else '单日'}最高发货{int(groups.max()) if len(groups) else 0}票（{tied}个分组并列）"
+    )
+    return f"<strong>本期事实：</strong>{esc(peak)}；截至截点签收率{pct(cur['签收率'])}；到期SLA样本{cur.get('sla_eligible', 0)}票，达成{pct(cur.get('sla_rate'))}；待复核备注{cur.get('review_count', 0)}票。"
 
 
-def render(template, repl):
-    out = template
-    for k, v in repl.items():
-        out = out.replace("__%s__" % k, str(v))
-    return out
+def render_report(
+    cur,
+    prev,
+    df,
+    config,
+    client,
+    mode,
+    first,
+    last,
+    report_date,
+    note,
+    actions,
+    previous_actions,
+):
+    title, cards, cmp_rows, cmp_note = comparison(prev, cur, mode, note)
+    rates, timing_rows, timing_note = timing(cur)
+    status_cards, exc_rows = exceptions(cur)
+    daily_header, daily_rows = daily_timing(cur, mode, df)
+    exc_header, exc_daily_rows = exception_daily(cur, mode)
+    imp_time, imp_exc = improvements(cur)
+    as_of = cur["as_of"]
+    quality = df.attrs.get("quality", {})
+    pieces = (
+        f"件数估算{int(df['__pieces_assumed'].sum())}票"
+        if df["__pieces_assumed"].any()
+        else f"总件数{num(cur['总件数'])}件"
+    )
+    commitment = "以上为基于记录的改进建议；处理结果以台账与闭环证据为准。"
+    if config.get("commitment_text"):
+        commitment = "客户配置的服务承诺：" + str(config["commitment_text"])
+    if config.get("response_hours") is not None:
+        commitment += (
+            f" 客户配置的客服响应时限：{num(config['response_hours'], 1)}小时。"
+        )
+    repl = {
+        "CLIENT_NAME": esc(short(client, 24)),
+        "REPORT_TYPE": "月报" if mode == "monthly" else "周报",
+        "PERIOD_SHORT": f"{first:%Y%m%d}-{last:%Y%m%d}",
+        "PERIOD_LABEL": f"统计周期：{first} — {last}",
+        "REPORT_DATE": report_date,
+        "PAGE_FOOTER_DATE": report_date,
+        "KPI1_LABEL": "本期总运单",
+        "KPI1_VALUE": num(cur["运单数"]),
+        "KPI1_UNIT": esc("票 · " + pieces),
+        "KPI2_LABEL": "到期运单SLA达成率",
+        "KPI2_VALUE": pct(cur.get("sla_rate")),
+        "KPI2_UNIT": f"达成{cur.get('sla_ontime', 0)} / 到期{cur.get('sla_eligible', 0)}票",
+        "KPI3_LABEL": "有效签收平均时效",
+        "KPI3_VALUE": num(cur["平均时效"], 1, "h"),
+        "KPI3_UNIT": f"中位数{num(cur['中位时效'], 1, 'h')} · 精确时间样本",
+        "KPI4_LABEL": "物流异常",
+        "KPI4_VALUE": num(
+            cur["物流异常单数"] if cur.get("备注字段覆盖票数", 0) else None
+        ),
+        "KPI4_UNIT": f"客户约定{cur['客户约定单数']} · 待复核{cur.get('review_count', 0)}票",
+        "CMP_TITLE": title,
+        "COMPARISON_ROWS": cmp_rows,
+        "CMP_NOTE": esc(short(cmp_note, 310)),
+        "PREV_LABEL": "上期" if prev else "暂无上期",
+        "CUR_LABEL": "本期",
+        "TIMING_TABLE": timing_rows,
+        "TIMING_NOTE": esc(timing_note),
+        "STATUS_CARDS": status_cards,
+        "EXCEPTION_TABLE": exc_rows,
+        "TIME_GRANULARITY": "每周" if mode == "monthly" else "每日",
+        "DAILY_TIME_HEADER": daily_header,
+        "DAILY_TIME_TABLE": daily_rows,
+        "PROVINCE_TABLE": province(cur, config["sla_target"]),
+        "EXC_GRANULARITY": "每周" if mode == "monthly" else "逐日",
+        "EXC_DAILY_HEADER": exc_header,
+        "EXC_DAILY_TABLE": exc_daily_rows,
+        "EXC_DAILY_NOTE": "按寄件日期分布；原因分类不代表处理完成。",
+        "EXC_NOTES": exception_notes(cur, actions),
+        "IMPROVE_TIME": imp_time,
+        "IMPROVE_EXC": imp_exc,
+        "OVERVIEW_NOTE": overview(cur, mode, df),
+        "DATA_SOURCE": esc(
+            f"运单导出{len(quality.get('input_files', []))}份 ｜ {config['brand']}"
+        ),
+        "SLA_NOTE": esc(
+            f"截至{as_of.strftime('%Y-%m-%d %H:%M %Z')}；到期{cur.get('sla_eligible', 0)}票/未到期{cur.get('sla_pending', 0)}票；精度不足{cur.get('sla_precision_excluded', 0)}票/签收待核实{cur.get('sla_invalid_excluded', 0)}票。参考SLA {num(config['sla_hours'])}h（省份可不同），参考目标{pct(config['sla_target'])}。"
+        ),
+        "ACTION_NOTE": esc(
+            short(
+                action_summary(actions, previous_actions, as_of, config["timezone"]),
+                160,
+            )
+        ),
+        "COMMITMENT": esc(short(commitment, 190)),
+        "QUALITY_NOTE": esc(
+            f"原始{quality.get('input_rows', len(df))}行；去重{quality.get('duplicate_rows', 0)}行；无效剔除{quality.get('excluded_rows', 0) - quality.get('duplicate_rows', 0)}行；周期外{quality.get('outside_period_rows', 0)}行/截点后{quality.get('as_of_excluded_rows', 0)}行。完整口径与明细见附件。"
+        ),
+        "WEIGHT_NOTE": esc(
+            "实际重量结构（已知重量运单）："
+            + "；".join(f"{k} {int(v)}票" for k, v in cur["weight_dist"].items())
+        ),
+    }
+    repl["QUALITY_NOTE"] += esc(
+        f" 签收字段覆盖{cur.get('签收字段覆盖票数', 0)}/{cur['运单数']}票；备注覆盖{cur.get('备注字段覆盖票数', 0)}/{cur['运单数']}票。"
+    )
+    repl["WEIGHT_NOTE"] += esc(f"；重量未知{cur.get('未知重量票数', 0)}票。")
+    for i, card in enumerate(cards, 1):
+        for suffix, value in zip(("LABEL", "MAIN", "SUB"), card):
+            repl[f"HL{i}_{suffix}"] = esc(value)
+    for label, rate in zip(("24", "48", "72", "72OVER"), rates):
+        repl[f"RATE{label}"] = pct(rate)
+        repl[f"RATE{label}_W"] = num(
+            max(0, min(100, rate)) if rate is not None else 0, 1
+        )
+
+    def token(match):
+        key = match.group(1)
+        if key not in repl:
+            raise ValueError(f"模板变量未定义：{key}")
+        return str(repl[key])
+
+    return re.sub(r"__([A-Z0-9_]+)__", token, TEMPLATE_PATH.read_text(encoding="utf-8"))
 
 
-def find_chrome():
-    for c in CHROME_CANDIDATES:
-        if os.path.isfile(c):
-            return c
-        try:
-            r = subprocess.run([c, "--version"], capture_output=True, timeout=10)
-            if r.returncode == 0:
-                return c
-        except Exception:
-            pass
-    return None
+def csv_output(path, data):
+    frame = data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    for column in frame.columns:
+        if frame[column].dtype == object or pd.api.types.is_string_dtype(frame[column]):
+            frame[column] = frame[column].map(
+                lambda x: (
+                    "'" + x
+                    if isinstance(x, str)
+                    and x.lstrip().startswith(("=", "+", "-", "@"))
+                    else x
+                )
+            )
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def to_pdf(chrome, html_path, pdf_path):
-    url = "file://" + os.path.abspath(html_path)
-    subprocess.run([chrome, "--headless", "--disable-gpu", "--no-pdf-header-footer",
-                    "--print-to-pdf=" + pdf_path, url],
-                   capture_output=True, timeout=120)
-    return os.path.isfile(pdf_path)
+def public_metrics(metrics):
+    return json_value({k: v for k, v in metrics.items() if not k.startswith("_")})
 
 
-def count_pages(pdf_path):
-    try:
-        with open(pdf_path, "rb") as f:
-            content = f.read()
-        return len(re.findall(rb"/Type\s*/Page[^s]", content))
-    except Exception:
-        return 0
+def refresh_manifest(manifest, run_dir):
+    files = sorted(
+        p for p in run_dir.iterdir() if p.is_file() and p.name != "manifest.json"
+    )
+    manifest["files"] = [p.name for p in files] + ["manifest.json"]
+    manifest["artifacts"] = [
+        {
+            "path": p.name,
+            "bytes": p.stat().st_size,
+            "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+        }
+        for p in files
+    ]
+    write_json_atomic(run_dir / "manifest.json", manifest)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="物流周报/月报生成器（含对比）")
-    ap.add_argument("--current", required=True, help="本期明细Excel，多个逗号分隔或目录")
-    ap.add_argument("--previous", help="上期明细Excel，多个逗号分隔或目录（可选）")
-    ap.add_argument("--mode", choices=["weekly", "monthly"], default="weekly")
-    ap.add_argument("--client", default="客户")
-    ap.add_argument("--period-label", help="周期标签（覆盖自动推断）")
-    ap.add_argument("--report-date", help="报告日期 YYYY-MM-DD，默认今天")
+def parser():
+    ap = argparse.ArgumentParser(description="物流客户周报/月报生成器 v" + VERSION)
+    ap.add_argument(
+        "--current",
+        action="append",
+        required=True,
+        help="本期Excel文件或目录，可重复；兼容逗号列表",
+    )
+    ap.add_argument("--previous", action="append", help="上期Excel文件或目录，可重复")
+    ap.add_argument("--previous-report", help="上期metrics.json；与--previous互斥")
+    ap.add_argument("--mode", choices=("weekly", "monthly"), default="weekly")
+    for option in (
+        "client",
+        "client-config",
+        "period-start",
+        "period-end",
+        "period-label",
+        "as-of",
+        "report-date",
+        "actions",
+        "chrome",
+    ):
+        ap.add_argument("--" + option)
+    ap.add_argument("--sheet", default="0", help="工作表名称或0起始序号")
+    ap.add_argument("--header", type=int, default=0, help="表头行，0起始")
     ap.add_argument("--output", default="logistics_report_out")
     ap.add_argument("--skip-pdf", action="store_true")
-    args = ap.parse_args()
+    return ap
 
-    cur_files = resolve_files(args.current)
-    prev_files = resolve_files(args.previous)
-    if not cur_files:
-        sys.exit("错误：--current 未提供有效文件")
-    cur_df = load_many(cur_files)
-    cur = analyze(cur_df)
-    cur["_mode"] = args.mode
 
-    prev = None
-    if prev_files:
-        prev_df = load_many(prev_files)
-        prev = analyze(prev_df)
-        prev["_mode"] = args.mode
-
-    report_type = "月报" if args.mode == "monthly" else "周报"
-    if args.period_label:
-        period = args.period_label
-    else:
-        period = infer_period_label(cur_df, args.mode)
-    period_short = period.replace("年", ".").replace("月", ".").replace("日", "")
-    report_date = args.report_date or dt.date.today().strftime("%Y年%m月%d日")
-    footer_date = report_date.replace("年", ".").replace("月", ".").replace("日", "")
-    cur_label = "本期" if prev is None else ("本月" if args.mode == "monthly" else "本周")
-    prev_label = "上期" if prev is None else ("上月" if args.mode == "monthly" else "上周")
-    prev_short = ("2026.07" if prev is None else period_short)  # 占位，仅无对比时不使用
-
-    # KPI
-    kpi1_lab = "本月总运单" if args.mode == "monthly" else "本周总运单"
-    kpi2_lab = "72小时签收率"
-    kpi3_lab = "平均签收时效"
-    kpi4_lab = "异常件"
-    kpi1_val = str(cur["运单数"])
-    kpi1_unit = "单 · 件数按运单计" if cur["件数按单计"] else "单 · 总件数%d件" % cur["总件数"]
-    kpi2_val = pct(cur["72h率"])
-    kpi2_unit = "已签收%d单 / %d单" % (cur["已签收单数"], cur["运单数"])
-    kpi3_val = "%.1fh" % cur["平均时效"]
-    kpi3_unit = "中位数%.0fh · 最快%.0fh" % (cur["中位时效"], cur["最快时效"])
-    kpi4_val = str(cur["异常单数"])
-    kpi4_unit = "单 · 占比%.1f%%" % cur["异常率"]
-
-    cmp_title, hl, cmp_rows, cmp_note = build_comparison(prev, cur)
-    r24, r48, r72, rover, timing_table, timing_note = build_timing(cur)
-    status_cards, exc_table = build_exception(cur)
-    dtime_header, dtime_rows = build_daily_time(cur, args.mode)
-    prov_rows = build_province(cur)
-    exc_h, exc_r, exc_note = build_exc_daily(cur, args.mode)
-    exc_notes = build_exc_notes(cur)
-    imp_time, imp_exc = build_improve(cur)
-    overview = build_overview(cur, args.client, args.mode)
-
-    # 省份签收需要 prov_sign——在 analyze 中未算，这里用异常表近似不可靠，改为从原始 df 计算
-    # 重新计算省份签收映射（analyze 里遗漏）
-    cur_prov_sign_map = {}
-    if not cur_df.empty:
-        sp = cur_df[cur_df["已签收"]].groupby("目的省份").size()
-        cur_prov_sign_map = sp.to_dict()
-    cur["prov_sign"] = cur_prov_sign_map
-    prov_rows = build_province(cur)  # 重算一次以带上签收数
-    # 改善方案依赖 prov_sign，重算
-    imp_time, imp_exc = build_improve(cur)
-
-    repl = {
-        "CLIENT_NAME": args.client,
-        "REPORT_TYPE": report_type,
-        "PERIOD_SHORT": period_short,
-        "PERIOD_LABEL": "统计周期：%s" % period,
-        "REPORT_DATE": report_date,
-        "PAGE_FOOTER_DATE": footer_date,
-        "KPI1_LABEL": kpi1_lab, "KPI1_VALUE": kpi1_val, "KPI1_UNIT": kpi1_unit,
-        "KPI2_LABEL": kpi2_lab, "KPI2_VALUE": kpi2_val, "KPI2_UNIT": kpi2_unit,
-        "KPI3_LABEL": kpi3_lab, "KPI3_VALUE": kpi3_val, "KPI3_UNIT": kpi3_unit,
-        "KPI4_LABEL": kpi4_lab, "KPI4_VALUE": kpi4_val, "KPI4_UNIT": kpi4_unit,
-        "CMP_TITLE": cmp_title,
-        "HL1_LABEL": hl[0][0], "HL1_MAIN": hl[0][1], "HL1_SUB": hl[0][2],
-        "HL2_LABEL": hl[1][0], "HL2_MAIN": hl[1][1], "HL2_SUB": hl[1][2],
-        "HL3_LABEL": hl[2][0], "HL3_MAIN": hl[2][1], "HL3_SUB": hl[2][2],
-        "HL4_LABEL": hl[3][0], "HL4_MAIN": hl[3][1], "HL4_SUB": hl[3][2],
-        "PREV_LABEL": prev_label, "CUR_LABEL": cur_label,
-        "COMPARISON_ROWS": cmp_rows, "CMP_NOTE": cmp_note,
-        "RATE24": pct(r24), "RATE24_W": round(r24, 1),
-        "RATE48": pct(r48), "RATE48_W": round(r48, 1),
-        "RATE72": pct(r72), "RATE72_W": round(r72, 1),
-        "RATE72OVER": pct(rover), "RATE72OVER_W": round(rover, 1),
-        "TIMING_TABLE": timing_table, "TIMING_NOTE": timing_note,
-        "STATUS_CARDS": status_cards, "EXCEPTION_TABLE": exc_table,
-        "TIME_GRANULARITY": "每周" if args.mode == "monthly" else "每日",
-        "DAILY_TIME_HEADER": dtime_header, "DAILY_TIME_TABLE": dtime_rows,
-        "PROVINCE_TABLE": prov_rows,
-        "EXC_GRANULARITY": "每周" if args.mode == "monthly" else "逐日",
-        "EXC_DAILY_HEADER": exc_h, "EXC_DAILY_TABLE": exc_r, "EXC_DAILY_NOTE": exc_note,
-        "EXC_NOTES": exc_notes,
-        "IMPROVE_TIME": imp_time, "IMPROVE_EXC": imp_exc,
-        "OVERVIEW_NOTE": overview,
-        "DATA_SOURCE": "数据来源：%s寄件运单成本明细" % args.client,
-    }
-
-    if not os.path.exists(TEMPLATE_PATH):
-        sys.exit("错误：未找到模板 %s" % TEMPLATE_PATH)
-    with open(TEMPLATE_PATH, encoding="utf-8") as f:
-        template = f.read()
-    html = render(template, repl)
-
-    os.makedirs(args.output, exist_ok=True)
-    safe_client = re.sub(r'[\\/:*?"<>|]', "", args.client)
-    base = "%s客户_物流%s" % (safe_client, report_type)
-    html_path = os.path.join(args.output, base + ".html")
-    pdf_path = os.path.join(args.output, base + ".pdf")
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    if args.skip_pdf:
-        print("HTML: %s" % os.path.abspath(html_path))
-        return
-
-    chrome = find_chrome()
-    if not chrome:
-        sys.exit("错误：未找到 Chrome，无法转 PDF。已生成 HTML：%s" % html_path)
-    ok = to_pdf(chrome, html_path, pdf_path)
-    if not ok:
-        sys.exit("错误：PDF 生成失败。已生成 HTML：%s" % html_path)
-    pages = count_pages(pdf_path)
-    print("PDF: %s" % os.path.abspath(pdf_path))
-    print("页数: %d" % pages)
-    if pages != 2:
-        print("警告：目标为2页，实际%d页，请人工检查排版。" % pages)
+def main(argv=None):
+    args = parser().parse_args(argv)
+    manifest, run_dir = None, None
+    try:
+        if args.previous and args.previous_report:
+            raise ValueError("--previous与--previous-report不能同时提供")
+        if args.header < 0:
+            raise ValueError("--header不得为负数")
+        config = load_config(args.client_config)
+        client = args.client or config.get("client") or "客户"
+        as_of = parse_as_of(args.as_of, config["timezone"])
+        report_date = (
+            dt.date.fromisoformat(args.report_date)
+            if args.report_date
+            else dt.datetime.now(ZoneInfo(config["timezone"])).date()
+        )
+        sheet = int(args.sheet) if args.sheet.isdigit() else args.sheet
+        inputs = resolve_files(args.current)
+        if not inputs:
+            raise ValueError("本期未找到可读取的Excel文件")
+        raw = load_many(
+            inputs,
+            sheet=sheet,
+            header=args.header,
+            column_mapping=config["column_mapping"],
+            timezone=config["timezone"],
+        )
+        selected, first, last = select_period(
+            raw, args.mode, args.period_start, args.period_end
+        )
+        cur = analyze(selected, as_of=as_of, config=config)
+        visible = cur["_data"]
+        visible.attrs["quality"] = cur["quality"]
+        if not cur["运单数"]:
+            raise ValueError("统计截止时刻之前没有有效寄件运单")
+        prev, previous_actions, baseline = None, [], None
+        note = (
+            "已签收件时效分布与到期运单SLA使用不同分母；日期精度不足不作精确小时评价。"
+        )
+        if args.previous:
+            previous_files = resolve_files(args.previous)
+            if not previous_files:
+                raise ValueError("上期未找到可读取的Excel文件")
+            raw_prev = load_many(
+                previous_files,
+                sheet=sheet,
+                header=args.header,
+                column_mapping=config["column_mapping"],
+                timezone=config["timezone"],
+            )
+            prev_df, pfirst, plast = select_period(raw_prev, args.mode)
+            if plast >= first:
+                raise ValueError("上期与本期时间窗口重叠或顺序错误")
+            previous_as_of = as_of - pd.Timedelta(days=(last - plast).days)
+            prev = analyze(prev_df, as_of=previous_as_of, config=config)
+            baseline = {
+                "source": {
+                    "kind": "excel",
+                    "input_files": prev["quality"]["input_files"],
+                },
+                "period": {"start": str(pfirst), "end": str(plast), "mode": args.mode},
+                "as_of": previous_as_of.isoformat(),
+                "metrics": public_metrics(prev),
+                "actions": [],
+            }
+            note += f" 上期{pfirst}至{plast}，按相同周期末观察滞后统计。"
+            if (last - first).days != (plast - pfirst).days:
+                note += " 两期天数不同，总量变化需结合日均量理解。"
+        elif args.previous_report:
+            saved = read_json(args.previous_report)
+            validate_snapshot(saved)
+            if (
+                saved.get("schema_version") != "2.0"
+                or saved.get("period", {}).get("mode") != args.mode
+            ):
+                raise ValueError("上期快照schema或周/月模式不匹配")
+            if saved.get("client") != client or saved.get("config") != json_value(
+                config
+            ):
+                raise ValueError("上期快照客户或统计配置不同，无法直接比较")
+            old_end = dt.date.fromisoformat(saved["period"]["end"])
+            if old_end >= first:
+                raise ValueError("上期快照与本期窗口重叠或顺序错误")
+            old_as_of = parse_as_of(saved.get("as_of"), config["timezone"])
+            aligned = as_of - pd.Timedelta(days=(last - old_end).days)
+            if abs((old_as_of - aligned).total_seconds()) > 1:
+                raise ValueError(
+                    "上期快照观察滞后不同，请用--previous重新按同截点口径计算"
+                )
+            prev, previous_actions = saved["metrics"], saved.get("actions", [])
+            baseline = {
+                "source": {
+                    "kind": "snapshot",
+                    "path": str(Path(args.previous_report).resolve()),
+                    "sha256": hashlib.sha256(
+                        Path(args.previous_report).read_bytes()
+                    ).hexdigest(),
+                },
+                "period": saved["period"],
+                "as_of": old_as_of.isoformat(),
+                "metrics": prev,
+                "actions": previous_actions,
+            }
+            note += " 上期来自已保存快照，配置与观察滞后已核对。"
+        else:
+            note += " 未提供上期文件或快照，本次不作环比。"
+        if args.period_label:
+            note += " 补充周期说明：" + short(args.period_label, 65)
+        actions = load_actions(args.actions)
+        known = set(visible["运单号"].astype(str)) | {
+            str(a.get("waybill")) for a in previous_actions
+        }
+        unknown = {a["waybill"] for a in actions} - known
+        if unknown:
+            raise ValueError(
+                "处理台账含本期及上期台账以外的运单：" + ", ".join(sorted(unknown)[:5])
+            )
+        base = artifact_basename(client, args.mode, first, last)
+        suffix = (
+            dt.datetime.now(ZoneInfo(config["timezone"])).strftime("%Y%m%dT%H%M%S")
+            + "_"
+            + uuid.uuid4().hex[:8]
+        )
+        run_dir = Path(args.output).resolve() / (base + "_" + suffix)
+        run_dir.mkdir(parents=True)
+        html_path, pdf_path = run_dir / (base + ".html"), run_dir / (base + ".pdf")
+        html_path.write_text(
+            render_report(
+                cur,
+                prev,
+                visible,
+                config,
+                client,
+                args.mode,
+                first,
+                last,
+                str(report_date),
+                note,
+                actions,
+                previous_actions,
+            ),
+            encoding="utf-8",
+        )
+        snapshot = {
+            "schema_version": "2.0",
+            "generator_version": VERSION,
+            "client": client,
+            "config": config,
+            "period": {"start": str(first), "end": str(last), "mode": args.mode},
+            "as_of": as_of,
+            "report_date": str(report_date),
+            "metrics": public_metrics(cur),
+            "actions": actions,
+            "comparison_note": note,
+            "comparison": baseline,
+        }
+        write_json_atomic(run_dir / "metrics.json", json_value(snapshot))
+        write_json_atomic(
+            run_dir / "quality.json", json_value(visible.attrs["quality"])
+        )
+        columns = [
+            "运单号",
+            "寄件时间",
+            "签收时间",
+            "目的省份",
+            "备注",
+            "异常类型",
+            "__source_file",
+            "__source_row",
+        ]
+        for name, frame in (
+            ("exceptions.csv", cur["异常表"]),
+            ("review.csv", cur.get("review_table", pd.DataFrame())),
+        ):
+            csv_output(run_dir / name, frame.reindex(columns=columns))
+        csv_output(
+            run_dir / "data_quality.csv",
+            pd.DataFrame(visible.attrs["quality"].get("issues", [])).reindex(
+                columns=["file", "row", "field", "reason", "value"]
+            ),
+        )
+        csv_output(
+            run_dir / "actions.csv",
+            pd.DataFrame(actions).reindex(
+                columns=[
+                    "waybill",
+                    "status",
+                    "owner",
+                    "due_at",
+                    "evidence",
+                    "note",
+                    "verified_closed",
+                ]
+            ),
+        )
+        csv_output(
+            run_dir / "province.csv",
+            pd.DataFrame(
+                [
+                    {
+                        "province": r["目的省份"],
+                        "waybills": int(r["运单"]),
+                        **cur["province_sla"].get(r["目的省份"], {}),
+                    }
+                    for _, r in cur["province"].iterrows()
+                ]
+            ).reindex(
+                columns=[
+                    "province",
+                    "waybills",
+                    "eligible",
+                    "ontime",
+                    "overdue",
+                    "pending",
+                    "rate",
+                    "precision_excluded",
+                    "invalid_excluded",
+                    "sla_hours",
+                ]
+            ),
+        )
+        shipment_columns = [
+            "运单号",
+            "寄件时间",
+            "签收时间",
+            "目的省份",
+            "件数",
+            "实际重量",
+            "结算重量",
+            "体积",
+            "备注",
+            "异常类型",
+            "已签收",
+            "时效",
+            "SLA时限小时",
+            "SLA截止时间",
+            "SLA样本状态",
+            "__pieces_assumed",
+            "__ship_precision",
+            "__sign_precision",
+            "__time_valid",
+            "__sign_available",
+            "__remark_available",
+            "__source_file",
+            "__source_row",
+        ]
+        csv_output(run_dir / "shipments.csv", visible.reindex(columns=shipment_columns))
+        manifest = {
+            "schema_version": "2.0",
+            "generator_version": VERSION,
+            "run_id": suffix,
+            "generated_at": dt.datetime.now(ZoneInfo(config["timezone"])).isoformat(),
+            "status": "html_only" if args.skip_pdf else "rendering",
+            "client": client,
+            "period": snapshot["period"],
+            "as_of": as_of.isoformat(),
+            "sources": cur["quality"]["input_files"],
+            "comparison_source": baseline["source"] if baseline else None,
+            "pdf_pages": None,
+            "validation": {
+                "pdf_parse": False,
+                "two_pages": False,
+                "visual_review": "manual_required",
+            },
+        }
+        refresh_manifest(manifest, run_dir)
+        if args.skip_pdf:
+            print(
+                json.dumps(
+                    {
+                        "status": "html_only",
+                        "html": str(html_path),
+                        "manifest": str(run_dir / "manifest.json"),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        chrome = find_chrome(args.chrome)
+        if not chrome:
+            raise RuntimeError(
+                "未找到Chrome/Chromium；HTML及附件已保存，可用--chrome指定或--skip-pdf"
+            )
+        pages = to_pdf(chrome, html_path, pdf_path)
+        manifest.update(
+            status="ready" if pages == 2 else "needs_review", pdf_pages=pages
+        )
+        manifest["validation"].update(pdf_parse=True, two_pages=pages == 2)
+        refresh_manifest(manifest, run_dir)
+        print(
+            json.dumps(
+                {
+                    "status": manifest["status"],
+                    "pdf": str(pdf_path),
+                    "pages": pages,
+                    "manifest": str(run_dir / "manifest.json"),
+                },
+                ensure_ascii=False,
+            )
+        )
+        if pages != 2:
+            print("PDF超出两页内容预算，需检查排版后交付。", file=sys.stderr)
+            return 2
+        return 0
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
+        if manifest is not None:
+            manifest.update(status="failed", error=short(str(exc), 500))
+            refresh_manifest(manifest, run_dir)
+        print("错误：" + str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

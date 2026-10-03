@@ -1,0 +1,13 @@
+{
+  "client": "合成演示客户",
+  "timezone": "Asia/Shanghai",
+  "sla_hours": 72,
+  "sla_target": 98,
+  "response_hours": null,
+  "province_sla_hours": {
+    "新疆": 120
+  },
+  "column_mapping": {},
+  "brand": "演示物流运营团队",
+  "commitment_text": ""
+}
